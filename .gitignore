@@ -1,0 +1,14 @@
+# Local device config (copied from .env.example, holds card numbers)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+*.swp
