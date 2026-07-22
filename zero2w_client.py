@@ -62,6 +62,18 @@ INITIAL_BACKOFF_SECONDS = 1.0
 # Silence enforced after the "say hello to start" prompt finishes playing, so
 # the speaker buffer + acoustic tail decay before the mic starts listening.
 PROMPT_SETTLE_SEC = 0.6
+# SET_VOLUME's 0-100 range maps onto [0, MAX_PLAYBACK_GAIN], not [0, 1.0].
+# Loopback echoes the raw, unnormalized mic signal (quiet on this hardware),
+# so 100% must be able to boost above unity, not just "no attenuation".
+# _apply_gain() hard-clips, so pushing past comfortable volume distorts
+# loudly rather than damaging anything.
+MAX_PLAYBACK_GAIN = 3.0
+# SET_MIC_GAIN's 0-100 range maps onto [0, MAX_INPUT_GAIN]. Measured raw mic
+# signal on this hardware peaks around 0.5% of full scale, so meaningful
+# gain needs to reach well into the tens, not just up to 1.0. The deployed
+# .env default (20.0) sits at 40% of this range, leaving room in both
+# directions to tune by ear.
+MAX_INPUT_GAIN = 50.0
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -364,7 +376,23 @@ class Zero2WClient:
 
             elif msg_type == "SET_VOLUME":
                 volume = payload.get("volume")
-                logger.info("Volume set to %s", volume)
+                if volume is None:
+                    logger.warning("SET_VOLUME received with no volume value")
+                else:
+                    pct = max(0, min(100, int(volume))) / 100.0
+                    gain = pct * MAX_PLAYBACK_GAIN
+                    self._playback.playback_gain = gain
+                    logger.info("Volume set to %s%% (playback_gain=%.2f)", volume, gain)
+
+            elif msg_type == "SET_MIC_GAIN":
+                mic_gain = payload.get("gain")
+                if mic_gain is None:
+                    logger.warning("SET_MIC_GAIN received with no gain value")
+                else:
+                    pct = max(0, min(100, int(mic_gain))) / 100.0
+                    gain = pct * MAX_INPUT_GAIN
+                    self._audio_capture.input_gain = gain
+                    logger.info("Mic gain set to %s%% (input_gain=%.2f)", mic_gain, gain)
 
             elif msg_type == "PLAY_AUDIO":
                 await self._handle_play_audio(ws, payload)
@@ -518,6 +546,12 @@ class Zero2WClient:
         """Play 'Say hello to start' on the Pi speaker, then listen for hello."""
         self._calibration_playing_prompt = True
         await ws.send(make_calibration_status("prompt"))
+        # Nothing else reads the mic while this coroutine is running (the
+        # audio loop that calls read_chunk() is blocked awaiting us). Keep
+        # draining arecord's stdout concurrently so its pipe never backs up
+        # into an overrun on the shared capture/playback codec -- see
+        # AudioCapture.drain_continuously() for the full mechanism.
+        drain_task = asyncio.create_task(self._audio_capture.drain_continuously())
         try:
             pcm = await get_calibration_prompt_pcm()
             if len(pcm) < MIN_PROMPT_PCM_BYTES:
@@ -545,6 +579,11 @@ class Zero2WClient:
             return False
         finally:
             self._calibration_playing_prompt = False
+            drain_task.cancel()
+            try:
+                await drain_task
+            except asyncio.CancelledError:
+                pass
 
         # The mic kept recording (including the prompt's own echo) the entire
         # time we were blocked playing it. Drop that backlog so the speak phase

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import array
 import asyncio
 import logging
+import math
 import os
 
 logger = logging.getLogger(__name__)
@@ -16,6 +18,54 @@ FORMAT = "S16_LE"
 BUFFER_US = 300000
 WRITE_CHUNK_BYTES = 4800  # 100 ms sub-chunks for stdin writes
 
+DEFAULT_PLAYBACK_GAIN = 1.0
+_INT16_MAX = 32767
+_INT16_MIN = -32768
+# Soft-knee limiter: below this fraction of full scale, gain is applied with
+# no shaping at all. Above it, the excess compresses asymptotically toward
+# the ceiling instead of hard-clipping. A gain tuned for a quiet source (e.g.
+# loopback echoing the raw, unnormalized mic signal) can massively over-drive
+# a louder one (e.g. OpenAI's own normalized TTS output) -- hard-clipping
+# that would produce an audible, harsh spike per sample over the ceiling;
+# this rounds it off smoothly instead.
+_LIMITER_KNEE_FRACTION = 0.85
+
+
+def _soft_limit(value: float) -> int:
+    """Gain-scaled sample -> int16, softly compressing anything past the knee."""
+    sign = 1.0 if value >= 0 else -1.0
+    magnitude = abs(value)
+    knee = _LIMITER_KNEE_FRACTION * _INT16_MAX
+    if magnitude <= knee:
+        limited = magnitude
+    else:
+        headroom = _INT16_MAX - knee
+        over = magnitude - knee
+        limited = knee + headroom * (1 - math.exp(-over / headroom))
+    result = sign * limited
+    if result > _INT16_MAX:
+        result = _INT16_MAX
+    elif result < _INT16_MIN:
+        result = _INT16_MIN
+    return int(result)
+
+
+def _apply_gain(pcm_bytes: bytes, gain: float) -> bytes:
+    """Scale PCM16 samples by gain, through a soft-knee limiter (see `_soft_limit`).
+
+    Peaks that would exceed the int16 ceiling compress smoothly toward it
+    instead of hard-clipping, which avoids an audible, harsh clipping
+    artifact when gain over-drives an already-loud source.
+    """
+    if gain == 1.0 or not pcm_bytes:
+        return pcm_bytes
+
+    samples = array.array("h")
+    samples.frombytes(pcm_bytes)
+    for i, value in enumerate(samples):
+        samples[i] = _soft_limit(value * gain)
+    return samples.tobytes()
+
 
 class PlaybackError(Exception):
     """Raised when playback cannot start or fails unexpectedly."""
@@ -24,14 +74,27 @@ class PlaybackError(Exception):
 class PlaybackManager:
     """Play raw PCM16 audio by piping chunks to an aplay subprocess."""
 
-    def __init__(self, device: str | None = None):
+    def __init__(self, device: str | None = None, *, playback_gain: float | None = None):
         self._device = device if device is not None else os.environ.get("AUDIO_OUTPUT_DEVICE")
+        if playback_gain is None:
+            playback_gain = float(os.environ.get("PLAYBACK_GAIN", DEFAULT_PLAYBACK_GAIN))
+        self._playback_gain = playback_gain
         self._process: asyncio.subprocess.Process | None = None
         self._streamed_bytes = 0
 
     @property
     def device(self) -> str | None:
         return self._device
+
+    @property
+    def playback_gain(self) -> float:
+        return self._playback_gain
+
+    @playback_gain.setter
+    def playback_gain(self, value: float) -> None:
+        """Update gain live (e.g. from a SET_VOLUME command); takes effect on
+        the next chunk written -- nothing needs to restart."""
+        self._playback_gain = value
 
     @property
     def is_streaming(self) -> bool:
@@ -90,6 +153,7 @@ class PlaybackManager:
         if not pcm_bytes and not is_final:
             return 0.0
 
+        pcm_bytes = _apply_gain(pcm_bytes, self._playback_gain)
         duration_sec = len(pcm_bytes) / BYTE_RATE
 
         if is_final:
