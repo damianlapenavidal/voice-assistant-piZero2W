@@ -56,7 +56,8 @@ DEVICE_TYPE = "pi_zero_2w"
 FIRMWARE_VERSION = "0.1.0"
 CAPABILITIES = ["audio_capture", "audio_playback"]
 STATUS_INTERVAL_SECONDS = 10
-MAX_RECONNECT_ATTEMPTS = 5
+# Reconnecting to the app uses exponential backoff, capped at this many seconds.
+MAX_BACKOFF_SECONDS = 30.0
 MAX_CALIBRATION_RETRIES = 5
 MIN_PROMPT_PCM_BYTES = 4000
 INITIAL_BACKOFF_SECONDS = 1.0
@@ -255,11 +256,19 @@ class Zero2WClient:
         """
         attempt = 0
 
-        while attempt < MAX_RECONNECT_ATTEMPTS:
+        # This is an always-on client: the Mac app (its server) being down or
+        # still booting is normal, not fatal. Retry indefinitely with capped
+        # backoff so we connect whenever the app appears -- notably on a fresh
+        # launch, where the app starts AFTER this service and can take longer to
+        # listen than a handful of attempts allow. A genuinely broken build
+        # still exits non-zero before this loop and is caught by the unit's
+        # Restart=on-failure + StartLimit guard; the backoff sleeps keep this
+        # gentle on the battery-powered Zero 2 W.
+        while True:
             try:
                 logger.info(
-                    "Connecting to %s (attempt %d/%d)...",
-                    self.server_url, attempt + 1, MAX_RECONNECT_ATTEMPTS,
+                    "Connecting to %s (attempt %d)...",
+                    self.server_url, attempt + 1,
                 )
                 async with websockets.connect(
                     self.server_url,
@@ -271,13 +280,10 @@ class Zero2WClient:
 
             except (OSError, ConnectionRefusedError, EOFError, InvalidMessage) as e:
                 attempt += 1
-                if attempt >= MAX_RECONNECT_ATTEMPTS:
-                    logger.error(
-                        "Failed to connect after %d attempts. Giving up.",
-                        MAX_RECONNECT_ATTEMPTS,
-                    )
-                    break
-                backoff = INITIAL_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                backoff = min(
+                    INITIAL_BACKOFF_SECONDS * (2 ** min(attempt - 1, 6)),
+                    MAX_BACKOFF_SECONDS,
+                )
                 logger.warning(
                     "Connection failed (%s). Retrying in %.1fs...", e, backoff,
                 )
@@ -285,13 +291,10 @@ class Zero2WClient:
 
             except ConnectionClosed as e:
                 attempt += 1
-                if attempt >= MAX_RECONNECT_ATTEMPTS:
-                    logger.error(
-                        "Lost connection after %d reconnect attempts. Giving up.",
-                        MAX_RECONNECT_ATTEMPTS,
-                    )
-                    break
-                backoff = INITIAL_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                backoff = min(
+                    INITIAL_BACKOFF_SECONDS * (2 ** min(attempt - 1, 6)),
+                    MAX_BACKOFF_SECONDS,
+                )
                 logger.warning(
                     "Connection closed (%s). Reconnecting in %.1fs...", e, backoff,
                 )
