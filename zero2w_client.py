@@ -40,6 +40,7 @@ try:
     from websockets.exceptions import (
         ConnectionClosed,
         ConnectionClosedError,
+        InvalidMessage,
         InvalidURI,
     )
 except ImportError:
@@ -268,7 +269,7 @@ class Zero2WClient:
                     attempt = 0  # Reset on successful connection
                     await self._session(ws)
 
-            except (OSError, ConnectionRefusedError) as e:
+            except (OSError, ConnectionRefusedError, EOFError, InvalidMessage) as e:
                 attempt += 1
                 if attempt >= MAX_RECONNECT_ATTEMPTS:
                     logger.error(
