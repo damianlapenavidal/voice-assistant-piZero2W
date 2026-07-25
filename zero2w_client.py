@@ -64,12 +64,16 @@ INITIAL_BACKOFF_SECONDS = 1.0
 # Silence enforced after the "say hello to start" prompt finishes playing, so
 # the speaker buffer + acoustic tail decay before the mic starts listening.
 PROMPT_SETTLE_SEC = 0.6
-# SET_VOLUME's 0-100 range maps onto [0, MAX_PLAYBACK_GAIN], not [0, 1.0].
-# Loopback echoes the raw, unnormalized mic signal (quiet on this hardware),
-# so 100% must be able to boost above unity, not just "no attenuation".
-# _apply_gain() hard-clips, so pushing past comfortable volume distorts
-# loudly rather than damaging anything.
-MAX_PLAYBACK_GAIN = 3.0
+# SET_VOLUME's 0-100 range maps onto [0, MAX_PLAYBACK_GAIN]. Everything this
+# client plays -- the calibration prompt asset and OpenAI's TTS -- is already
+# normalized and near full scale, so volume is pure attenuation: 100% == the
+# source untouched (the loudest a normalized signal is meant to play), lower
+# values scale it down. Capping at unity keeps the soft-knee limiter from ever
+# engaging on these sources, which is what made the slider inert above ~30%:
+# gains >1.0 drove loud TTS into the knee, compressing the whole upper half of
+# the slider into the ceiling. (The old range boosted above unity for a quiet
+# raw-mic loopback source that this thin client no longer has.)
+MAX_PLAYBACK_GAIN = 1.0
 # SET_MIC_GAIN's 0-100 range maps onto [0, MAX_INPUT_GAIN]. Measured raw mic
 # signal on this hardware peaks around 0.5% of full scale, so meaningful
 # gain needs to reach well into the tens, not just up to 1.0. The deployed

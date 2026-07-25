@@ -23,11 +23,10 @@ _INT16_MAX = 32767
 _INT16_MIN = -32768
 # Soft-knee limiter: below this fraction of full scale, gain is applied with
 # no shaping at all. Above it, the excess compresses asymptotically toward
-# the ceiling instead of hard-clipping. A gain tuned for a quiet source (e.g.
-# loopback echoing the raw, unnormalized mic signal) can massively over-drive
-# a louder one (e.g. OpenAI's own normalized TTS output) -- hard-clipping
-# that would produce an audible, harsh spike per sample over the ceiling;
-# this rounds it off smoothly instead.
+# the ceiling instead of hard-clipping. Playback volume is attenuation-only
+# (see MAX_PLAYBACK_GAIN), so this knee no longer shapes normal output; it
+# stays as a safety net against any future boost path (or a source that
+# already peaks past the knee) producing a harsh per-sample clipping spike.
 _LIMITER_KNEE_FRACTION = 0.85
 
 
