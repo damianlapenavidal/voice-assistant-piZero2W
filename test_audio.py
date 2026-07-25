@@ -431,6 +431,7 @@ class _FakeWebSocket:
     def __init__(self, messages: list[str]):
         self._messages = messages
         self.sent: list[str] = []
+        self._recv_index = 0
 
     def __aiter__(self):
         return self._gen()
@@ -438,6 +439,15 @@ class _FakeWebSocket:
     async def _gen(self):
         for m in self._messages:
             yield m
+
+    async def recv(self) -> str:
+        """Pop the next preset message, for code that awaits recv() directly
+        (the handshake) rather than iterating."""
+        if self._recv_index >= len(self._messages):
+            raise AssertionError("recv() called with no messages left")
+        msg = self._messages[self._recv_index]
+        self._recv_index += 1
+        return msg
 
     async def send(self, msg: str) -> None:
         self.sent.append(msg)
@@ -818,6 +828,90 @@ async def _test_mic_gain_change_applies_to_next_chunk_read():
     print("  PASS: test_mic_gain_change_applies_to_next_chunk_read")
 
 
+def _test_volume_percent_gain_roundtrip():
+    """gain_to_volume_percent inverts volume_percent_to_gain.
+
+    HELLO reports the device's startup gain as a slider position, so the two
+    directions must agree -- otherwise the app draws its slider somewhere the
+    hardware isn't and the mismatch we're fixing comes back.
+    """
+    from zero2w_client import gain_to_volume_percent, volume_percent_to_gain
+
+    for pct in range(0, 101):
+        assert gain_to_volume_percent(volume_percent_to_gain(pct)) == pct
+
+    # The deployed .env fallback maps to a sensible slider position.
+    assert gain_to_volume_percent(0.35) == 59
+    # Degenerate inputs don't blow up or report a bogus position.
+    assert gain_to_volume_percent(0.0) == 0
+    assert gain_to_volume_percent(-1.0) == 0
+    assert gain_to_volume_percent(99.0) == 100
+
+    print("  PASS: test_volume_percent_gain_roundtrip")
+
+
+async def _test_handshake_adopts_app_levels():
+    """The device takes the app's remembered levels from HELLO_ACK.
+
+    This is what stops the first slider touch of a session from jumping the
+    volume: the app's value is applied at handshake, before any audio plays.
+    """
+    from zero2w_client import (
+        MAX_INPUT_GAIN,
+        Zero2WClient,
+        volume_percent_to_gain,
+    )
+
+    client = Zero2WClient("ws://test")
+    client._playback.playback_gain = 0.35  # .env startup fallback
+
+    ws = _FakeWebSocket([json.dumps({
+        "type": "HELLO_ACK",
+        "payload": {
+            "session_id": "sess_1",
+            "audio_config": {"sample_rate": 24000, "volume": 30, "mic_gain": 60},
+        },
+    })])
+
+    await client._handshake(ws)
+
+    assert abs(client._playback.playback_gain - volume_percent_to_gain(30)) < 1e-9
+    assert abs(client._audio_capture.input_gain - 0.6 * MAX_INPUT_GAIN) < 1e-9
+
+    # HELLO advertised the device's pre-adoption level so the app can sync too.
+    sent = json.loads(ws.sent[0])
+    assert sent["type"] == "HELLO"
+    assert sent["payload"]["volume"] == 59
+
+    print("  PASS: test_handshake_adopts_app_levels")
+
+
+async def _test_handshake_keeps_own_levels_when_app_sends_none():
+    """No levels in HELLO_ACK -> the .env startup value stands, unchanged."""
+    from zero2w_client import Zero2WClient
+
+    client = Zero2WClient("ws://test")
+    client._playback.playback_gain = 0.35
+
+    ws = _FakeWebSocket([json.dumps({
+        "type": "HELLO_ACK",
+        "payload": {"session_id": "s", "audio_config": {"sample_rate": 24000}},
+    })])
+
+    await client._handshake(ws)
+    assert client._playback.playback_gain == 0.35
+
+    # A malformed value is ignored rather than crashing the handshake.
+    ws = _FakeWebSocket([json.dumps({
+        "type": "HELLO_ACK",
+        "payload": {"session_id": "s", "audio_config": {"volume": "loud"}},
+    })])
+    await client._handshake(ws)
+    assert client._playback.playback_gain == 0.35
+
+    print("  PASS: test_handshake_keeps_own_levels_when_app_sends_none")
+
+
 def run_async_test(coro):
     asyncio.run(coro)
 
@@ -830,6 +924,7 @@ def main():
         _test_apply_gain_scales_and_clips,
         _test_soft_limit_shape,
         _test_openai_style_loud_source_does_not_hard_clip,
+        _test_volume_percent_gain_roundtrip,
     ]
     async_tests = [
         _test_audio_capture_read_chunk,
@@ -848,6 +943,8 @@ def main():
         _test_set_mic_gain_updates_input_gain,
         _test_set_mic_gain_not_blocked_by_active_playback,
         _test_mic_gain_change_applies_to_next_chunk_read,
+        _test_handshake_adopts_app_levels,
+        _test_handshake_keeps_own_levels_when_app_sends_none,
         _test_skip_calibration_streams_immediately,
         _test_fresh_start_runs_calibration,
         _test_drain_buffered_audio_discards_backlog,

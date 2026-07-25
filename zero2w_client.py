@@ -22,6 +22,7 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import os
 import platform
 import socket
@@ -108,6 +109,26 @@ def mic_percent_to_gain(mic_gain: int) -> float:
     pct = max(0, min(100, int(mic_gain))) / 100.0
     return pct * MAX_INPUT_GAIN
 
+
+def gain_to_volume_percent(gain: float) -> int:
+    """Inverse of `volume_percent_to_gain` -- a gain as a slider position.
+
+    Lets the device report its startup level (PLAYBACK_GAIN from .env) in the
+    app's units, so the slider can be shown where the hardware actually is
+    instead of at an unrelated default. Without this the two disagree until
+    the first SET_VOLUME, which is exactly the jump users notice.
+    """
+    if gain <= 0 or MAX_PLAYBACK_GAIN <= 0:
+        return 0
+    return round(min(1.0, math.sqrt(gain / MAX_PLAYBACK_GAIN)) * 100)
+
+
+def input_gain_to_percent(gain: float) -> int:
+    """Inverse of `mic_percent_to_gain` -- a capture gain as a slider position."""
+    if gain <= 0 or MAX_INPUT_GAIN <= 0:
+        return 0
+    return round(min(1.0, gain / MAX_INPUT_GAIN) * 100)
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -185,14 +206,25 @@ def parse_message(raw: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def make_hello() -> str:
-    """Create a HELLO message with device info."""
-    return make_message("HELLO", {
+def make_hello(volume: int | None = None, mic_gain: int | None = None) -> str:
+    """Create a HELLO message with device info.
+
+    Includes the device's current levels as slider positions so the app can
+    show its sliders where the hardware actually is. Without this the device
+    boots at PLAYBACK_GAIN (from .env) while the app's slider sits at some
+    unrelated default, and the first SET_VOLUME snaps the volume audibly.
+    """
+    payload = {
         "device_id": get_device_id(),
         "device_type": DEVICE_TYPE,
         "firmware_version": FIRMWARE_VERSION,
         "capabilities": CAPABILITIES,
-    })
+    }
+    if volume is not None:
+        payload["volume"] = volume
+    if mic_gain is not None:
+        payload["mic_gain"] = mic_gain
+    return make_message("HELLO", payload)
 
 
 def make_device_status(is_recording: bool) -> str:
@@ -366,7 +398,10 @@ class Zero2WClient:
 
     async def _handshake(self, ws) -> None:
         """Send HELLO and wait for HELLO_ACK."""
-        hello = make_hello()
+        hello = make_hello(
+            volume=gain_to_volume_percent(self._playback.playback_gain),
+            mic_gain=input_gain_to_percent(self._audio_capture.input_gain),
+        )
         logger.info("Sending HELLO (device_id=%s)", get_device_id())
         await ws.send(hello)
 
@@ -389,6 +424,45 @@ class Zero2WClient:
             "Handshake complete! session_id=%s, audio_config=%s",
             self.session_id, audio_config,
         )
+        self._adopt_initial_levels(payload, audio_config)
+
+    def _adopt_initial_levels(self, payload: dict, audio_config: dict) -> None:
+        """Take the app's remembered slider positions, if it sent any.
+
+        The app is the source of truth for levels the user has set: those
+        persist across reconnects, whereas the device's own startup value is
+        just the .env fallback. Adopting them here -- before any audio plays --
+        is what stops the first slider touch of a session from audibly
+        jumping the volume. Silently ignored if the app sends nothing, in
+        which case the levels we advertised in HELLO stand.
+        """
+        for source in (audio_config, payload):
+            volume = source.get("volume")
+            if volume is not None:
+                try:
+                    gain = volume_percent_to_gain(volume)
+                except (TypeError, ValueError):
+                    logger.warning("Ignoring unusable volume in HELLO_ACK: %r", volume)
+                    break
+                self._playback.playback_gain = gain
+                logger.info(
+                    "Adopted app volume %s%% (playback_gain=%.2f)", volume, gain,
+                )
+                break
+
+        for source in (audio_config, payload):
+            mic_gain = source.get("mic_gain")
+            if mic_gain is not None:
+                try:
+                    gain = mic_percent_to_gain(mic_gain)
+                except (TypeError, ValueError):
+                    logger.warning("Ignoring unusable mic_gain in HELLO_ACK: %r", mic_gain)
+                    break
+                self._audio_capture.input_gain = gain
+                logger.info(
+                    "Adopted app mic gain %s%% (input_gain=%.2f)", mic_gain, gain,
+                )
+                break
 
     async def _status_loop(self, ws) -> None:
         """Send DEVICE_STATUS messages at a regular interval."""
