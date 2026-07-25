@@ -152,7 +152,10 @@ class PlaybackManager:
         if not pcm_bytes and not is_final:
             return 0.0
 
-        pcm_bytes = _apply_gain(pcm_bytes, self._playback_gain)
+        # Gain is deliberately NOT applied here: it is applied per sub-chunk at
+        # write time (see `_write_with_live_gain`) so a SET_VOLUME arriving
+        # mid-response affects the part that hasn't been handed to aplay yet.
+        # Gain does not change length, so duration is safe to compute up front.
         duration_sec = len(pcm_bytes) / BYTE_RATE
 
         if is_final:
@@ -171,10 +174,26 @@ class PlaybackManager:
             if self._process is None or self._process.stdin is None:
                 raise PlaybackError("aplay process is not running")
 
-        self._process.stdin.write(pcm_bytes)
-        await self._process.stdin.drain()
+        await self._write_with_live_gain(self._process.stdin, pcm_bytes)
         self._streamed_bytes += len(pcm_bytes)
         return duration_sec
+
+    async def _write_with_live_gain(self, stdin, pcm_bytes: bytes) -> None:
+        """Feed PCM to aplay in sub-chunks, re-reading gain before each one.
+
+        Re-reading `self._playback_gain` per sub-chunk (rather than scaling the
+        whole buffer up front) is what makes the volume slider audible during a
+        response instead of only on the next one. Remaining lag is just what is
+        already committed downstream: the OS pipe buffer plus aplay's own
+        BUFFER_US, since those bytes are scaled and gone.
+        """
+        for offset in range(0, len(pcm_bytes), WRITE_CHUNK_BYTES):
+            part = pcm_bytes[offset:offset + WRITE_CHUNK_BYTES]
+            stdin.write(_apply_gain(part, self._playback_gain))
+            # drain() is the backpressure that paces this loop at roughly
+            # real-time playback rate; without it every sub-chunk would be
+            # scaled and buffered immediately and gain would be baked in again.
+            await stdin.drain()
 
     async def finalize_streaming(self) -> float:
         """Close streaming stdin and wait for aplay to finish.
@@ -231,10 +250,7 @@ class PlaybackManager:
         stderr_data = b""
         try:
             if pcm_bytes and process.stdin is not None:
-                for offset in range(0, len(pcm_bytes), WRITE_CHUNK_BYTES):
-                    part = pcm_bytes[offset:offset + WRITE_CHUNK_BYTES]
-                    process.stdin.write(part)
-                    await process.stdin.drain()
+                await self._write_with_live_gain(process.stdin, pcm_bytes)
 
             if process.stdin is not None and not process.stdin.is_closing():
                 process.stdin.close()

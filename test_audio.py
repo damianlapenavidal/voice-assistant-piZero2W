@@ -18,7 +18,7 @@ import struct
 
 from audio_capture import CAPTURE_CHANNELS, CHUNK_BYTES, AudioCapture
 from audio_capture import _soft_limit as _capture_soft_limit
-from audio_playback import BYTE_RATE, PlaybackManager, _apply_gain
+from audio_playback import BYTE_RATE, WRITE_CHUNK_BYTES, PlaybackManager, _apply_gain
 from zero2w_client import make_audio_frame, parse_message
 
 
@@ -644,6 +644,49 @@ async def _test_set_volume_not_blocked_by_active_playback():
     print("  PASS: test_set_volume_not_blocked_by_active_playback")
 
 
+async def _test_volume_change_applies_partway_through_a_response():
+    """Reproduces the reported bug: a SET_VOLUME during a whole-response blob
+    must affect the audio not yet handed to aplay, not just the next response.
+
+    The whole response used to be scaled by playback_gain in one pass before
+    any bytes were written, so a mid-response volume change was inaudible
+    until playback drained. Gain is now re-read per sub-chunk at write time.
+    """
+    mock_process, fake_stdin = _make_mock_streaming_process()
+    mock_process.returncode = 0
+
+    playback = PlaybackManager(playback_gain=1.0)
+
+    # Turn the volume down after the first sub-chunk has been written, i.e.
+    # while the rest of the response is still queued behind aplay's buffer.
+    async def _drain_then_turn_down():
+        playback.playback_gain = 0.5
+
+    fake_stdin.drain = AsyncMock(side_effect=_drain_then_turn_down)
+
+    # Three 100 ms sub-chunks of a constant tone, as one whole-response frame.
+    samples_per_subchunk = WRITE_CHUNK_BYTES // 2
+    pcm = struct.pack("<%dh" % (samples_per_subchunk * 3), *([1000] * (samples_per_subchunk * 3)))
+
+    with patch(
+        "audio_playback.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=mock_process),
+    ):
+        await playback.play_pcm16_chunk(pcm, is_final=True)
+
+    writes = [call[0][0] for call in fake_stdin.write.call_args_list]
+    assert len(writes) == 3, f"expected 3 sub-chunk writes, got {len(writes)}"
+
+    # First sub-chunk went out at the original volume...
+    assert struct.unpack("<h", writes[0][:2])[0] == 1000
+    # ...and everything after the change is attenuated. Baking the gain in up
+    # front would have left these at 1000 for the whole response.
+    assert struct.unpack("<h", writes[1][:2])[0] == 500
+    assert struct.unpack("<h", writes[2][:2])[0] == 500
+
+    print("  PASS: test_volume_change_applies_partway_through_a_response")
+
+
 def run_async_test(coro):
     asyncio.run(coro)
 
@@ -669,6 +712,7 @@ def main():
         _test_streaming_finalize_with_empty_final_chunk,
         _test_set_volume_updates_playback_gain,
         _test_set_volume_not_blocked_by_active_playback,
+        _test_volume_change_applies_partway_through_a_response,
         _test_set_mic_gain_updates_input_gain,
         _test_skip_calibration_streams_immediately,
         _test_fresh_start_runs_calibration,
