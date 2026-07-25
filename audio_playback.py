@@ -17,6 +17,18 @@ BYTE_RATE = SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE
 FORMAT = "S16_LE"
 BUFFER_US = 300000
 WRITE_CHUNK_BYTES = 4800  # 100 ms sub-chunks for stdin writes
+# How far ahead of real-time playback the writer is allowed to run.
+#
+# Pipe backpressure alone is far too loose to keep live volume responsive:
+# asyncio's stdin transport buffers 64 KB before drain() blocks, and the OS
+# pipe holds ~64 KB more -- ~2.7 s of audio at BYTE_RATE. A response shorter
+# than that is written, and therefore gain-scaled, in full before a single
+# sample reaches the speaker, so a mid-response SET_VOLUME could never be
+# heard. Pacing writes against a wall clock bounds that staleness instead.
+#
+# Must stay comfortably above BUFFER_US so aplay's own buffer never starves
+# (which would stutter), while small enough that the slider feels live.
+MAX_WRITE_LEAD_SEC = 0.4
 
 DEFAULT_PLAYBACK_GAIN = 1.0
 _INT16_MAX = 32767
@@ -80,6 +92,9 @@ class PlaybackManager:
         self._playback_gain = playback_gain
         self._process: asyncio.subprocess.Process | None = None
         self._streamed_bytes = 0
+        # Wall-clock timeline for write pacing; see _write_with_live_gain.
+        self._pace_start: float | None = None
+        self._pace_written_sec = 0.0
 
     @property
     def device(self) -> str | None:
@@ -120,6 +135,7 @@ class PlaybackManager:
             return
 
         self._streamed_bytes = 0
+        self._reset_pacing()
         cmd = self._build_command()
         logger.info("Starting audio playback: %s", " ".join(cmd))
 
@@ -178,22 +194,39 @@ class PlaybackManager:
         self._streamed_bytes += len(pcm_bytes)
         return duration_sec
 
+    def _reset_pacing(self) -> None:
+        """Begin a new playback timeline for write pacing."""
+        self._pace_start = None
+        self._pace_written_sec = 0.0
+
     async def _write_with_live_gain(self, stdin, pcm_bytes: bytes) -> None:
         """Feed PCM to aplay in sub-chunks, re-reading gain before each one.
 
-        Re-reading `self._playback_gain` per sub-chunk (rather than scaling the
-        whole buffer up front) is what makes the volume slider audible during a
-        response instead of only on the next one. Remaining lag is just what is
-        already committed downstream: the OS pipe buffer plus aplay's own
-        BUFFER_US, since those bytes are scaled and gone.
+        Two things together make the volume slider audible mid-response:
+        re-reading `self._playback_gain` per sub-chunk rather than scaling the
+        whole buffer up front, and pacing the writes so only a bounded amount
+        of already-scaled audio is ever committed downstream (see
+        MAX_WRITE_LEAD_SEC -- pipe backpressure alone is ~2.7 s too loose).
+
+        The timeline spans calls, so streamed chunks arriving faster than
+        real time are paced as one continuous response rather than each call
+        getting a fresh lead allowance.
         """
+        loop = asyncio.get_running_loop()
+        if self._pace_start is None:
+            self._pace_start = loop.time()
+
         for offset in range(0, len(pcm_bytes), WRITE_CHUNK_BYTES):
             part = pcm_bytes[offset:offset + WRITE_CHUNK_BYTES]
             stdin.write(_apply_gain(part, self._playback_gain))
-            # drain() is the backpressure that paces this loop at roughly
-            # real-time playback rate; without it every sub-chunk would be
-            # scaled and buffered immediately and gain would be baked in again.
             await stdin.drain()
+            self._pace_written_sec += len(part) / BYTE_RATE
+
+            # Sleep off anything queued beyond the allowed lead, so the next
+            # sub-chunk is scaled with whatever gain is current by then.
+            lead = self._pace_written_sec - (loop.time() - self._pace_start)
+            if lead > MAX_WRITE_LEAD_SEC:
+                await asyncio.sleep(lead - MAX_WRITE_LEAD_SEC)
 
     async def finalize_streaming(self) -> float:
         """Close streaming stdin and wait for aplay to finish.
@@ -207,6 +240,7 @@ class PlaybackManager:
         duration_sec = self._streamed_bytes / BYTE_RATE
         self._process = None
         self._streamed_bytes = 0
+        self._reset_pacing()
 
         stderr_data = b""
         try:
@@ -275,6 +309,7 @@ class PlaybackManager:
         process = self._process
         self._process = None
         self._streamed_bytes = 0
+        self._reset_pacing()
 
         if process is None:
             return

@@ -18,7 +18,13 @@ import struct
 
 from audio_capture import CAPTURE_CHANNELS, CHUNK_BYTES, AudioCapture
 from audio_capture import _soft_limit as _capture_soft_limit
-from audio_playback import BYTE_RATE, WRITE_CHUNK_BYTES, PlaybackManager, _apply_gain
+from audio_playback import (
+    BYTE_RATE,
+    MAX_WRITE_LEAD_SEC,
+    WRITE_CHUNK_BYTES,
+    PlaybackManager,
+    _apply_gain,
+)
 from zero2w_client import make_audio_frame, parse_message
 
 
@@ -438,21 +444,38 @@ class _FakeWebSocket:
 
 
 async def _test_set_volume_updates_playback_gain():
-    """SET_VOLUME (0-100) maps onto [0, MAX_PLAYBACK_GAIN] so 100% can boost
-    above unity -- loopback echoes the raw, unnormalized (quiet) mic signal,
-    so unity alone isn't enough headroom."""
+    """SET_VOLUME (0-100) maps onto [0, MAX_PLAYBACK_GAIN] with a square-law
+    taper, so the audible change is spread across the slider rather than
+    crammed into the bottom of its travel."""
     from zero2w_client import MAX_PLAYBACK_GAIN, Zero2WClient
 
     client = Zero2WClient("ws://test")
 
     ws = _FakeWebSocket([json.dumps({"type": "SET_VOLUME", "payload": {"volume": 70}})])
     await client._receive_loop(ws)
-    assert abs(client._playback.playback_gain - 0.7 * MAX_PLAYBACK_GAIN) < 1e-9
+    assert abs(client._playback.playback_gain - 0.49 * MAX_PLAYBACK_GAIN) < 1e-9
+
+    # The endpoints stay exact: full scale is the source untouched, 0 is silence.
+    ws = _FakeWebSocket([json.dumps({"type": "SET_VOLUME", "payload": {"volume": 100}})])
+    await client._receive_loop(ws)
+    assert abs(client._playback.playback_gain - MAX_PLAYBACK_GAIN) < 1e-9
+
+    ws = _FakeWebSocket([json.dumps({"type": "SET_VOLUME", "payload": {"volume": 0}})])
+    await client._receive_loop(ws)
+    assert client._playback.playback_gain == 0.0
 
     # Out-of-range values are clamped, not rejected.
     ws = _FakeWebSocket([json.dumps({"type": "SET_VOLUME", "payload": {"volume": 150}})])
     await client._receive_loop(ws)
     assert abs(client._playback.playback_gain - MAX_PLAYBACK_GAIN) < 1e-9
+
+    # Monotonic across the whole range -- raising the slider never gets quieter.
+    prev = -1.0
+    for pct in range(0, 101, 10):
+        ws = _FakeWebSocket([json.dumps({"type": "SET_VOLUME", "payload": {"volume": pct}})])
+        await client._receive_loop(ws)
+        assert client._playback.playback_gain > prev
+        prev = client._playback.playback_gain
 
     print("  PASS: test_set_volume_updates_playback_gain")
 
@@ -636,7 +659,7 @@ async def _test_set_volume_not_blocked_by_active_playback():
     await client._receive_loop(ws)
 
     # The volume landed despite playback never having completed.
-    assert abs(client._playback.playback_gain - 0.5 * MAX_PLAYBACK_GAIN) < 1e-9
+    assert abs(client._playback.playback_gain - 0.25 * MAX_PLAYBACK_GAIN) < 1e-9
 
     gate.set()
     await client._stop_playback_worker()
@@ -687,6 +710,114 @@ async def _test_volume_change_applies_partway_through_a_response():
     print("  PASS: test_volume_change_applies_partway_through_a_response")
 
 
+async def _test_write_pacing_bounds_in_flight_audio():
+    """Writes are paced against a clock, not left to pipe backpressure.
+
+    This is the reason a volume change is audible at all. asyncio's stdin
+    transport buffers 64 KB before drain() blocks and the OS pipe holds ~64 KB
+    more -- about 2.7 s of audio -- so without pacing a typical response is
+    written, and gain-stamped, in full before a sample reaches the speaker.
+    """
+    mock_process, fake_stdin = _make_mock_streaming_process()
+    playback = PlaybackManager(playback_gain=1.0)
+
+    # 5 s of audio: comfortably more than pipe buffering alone would swallow.
+    total_sec = 5.0
+    pcm = b"\x00\x01" * int(BYTE_RATE * total_sec // 2)
+
+    with patch(
+        "audio_playback.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=mock_process),
+    ):
+        task = asyncio.create_task(playback.play_pcm16_chunk(pcm, is_final=False))
+        await asyncio.sleep(0.05)
+
+        written = sum(len(c[0][0]) for c in fake_stdin.write.call_args_list)
+        written_sec = written / BYTE_RATE
+
+        # Only the lead allowance is committed; the rest is still unscaled and
+        # will pick up any volume change that arrives in the meantime.
+        assert written_sec < total_sec, "whole response written at once -- pacing not applied"
+        assert written_sec <= MAX_WRITE_LEAD_SEC + 0.2, (
+            f"{written_sec:.2f}s in flight, expected ~{MAX_WRITE_LEAD_SEC}s"
+        )
+
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    print("  PASS: test_write_pacing_bounds_in_flight_audio")
+
+
+async def _test_set_mic_gain_not_blocked_by_active_playback():
+    """SET_MIC_GAIN is applied while a PLAY_AUDIO frame is still playing.
+
+    Mic sensitivity has no baked-in-gain problem (gain is applied in
+    read_chunk, as each chunk is pulled off arecord), so the only thing that
+    could delay it is the receive loop stalling behind playback. Pin that it
+    doesn't.
+    """
+    from zero2w_client import MAX_INPUT_GAIN, Zero2WClient
+
+    client = Zero2WClient("ws://test")
+
+    gate = asyncio.Event()
+
+    async def _hang(ws, payload):
+        await gate.wait()
+
+    client._handle_play_audio = _hang
+
+    b64 = base64.b64encode(b"\x00\x01" * 10).decode()
+    ws = _FakeWebSocket([
+        json.dumps({"type": "PLAY_AUDIO", "payload": {"audio": b64}}),
+        json.dumps({"type": "SET_MIC_GAIN", "payload": {"gain": 60}}),
+    ])
+
+    await client._receive_loop(ws)
+
+    assert abs(client._audio_capture.input_gain - 0.6 * MAX_INPUT_GAIN) < 1e-9
+
+    gate.set()
+    await client._stop_playback_worker()
+
+    print("  PASS: test_set_mic_gain_not_blocked_by_active_playback")
+
+
+async def _test_mic_gain_change_applies_to_next_chunk_read():
+    """A mid-stream mic gain change affects the very next chunk read.
+
+    Nothing is pre-scaled on the capture side, so there is no equivalent of
+    playback's in-flight buffer: the new gain applies as soon as the next
+    chunk comes off arecord.
+    """
+    stereo = struct.pack("<4h", 1000, 0, 1000, 0) * (CHUNK_BYTES // 4)
+
+    mock_process = MagicMock()
+    mock_process.returncode = None
+    mock_process.stdout = MagicMock()
+    mock_process.stdout.readexactly = AsyncMock(return_value=stereo)
+    mock_process.stderr = asyncio.StreamReader()
+
+    with patch(
+        "audio_capture.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=mock_process),
+    ):
+        capture = AudioCapture(input_gain=1.0)
+        await capture.start()
+
+        first = await capture.read_chunk()
+        assert struct.unpack("<h", first[:2])[0] == 1000
+
+        capture.input_gain = 3.0
+        second = await capture.read_chunk()
+        assert struct.unpack("<h", second[:2])[0] == 3000
+
+    print("  PASS: test_mic_gain_change_applies_to_next_chunk_read")
+
+
 def run_async_test(coro):
     asyncio.run(coro)
 
@@ -713,7 +844,10 @@ def main():
         _test_set_volume_updates_playback_gain,
         _test_set_volume_not_blocked_by_active_playback,
         _test_volume_change_applies_partway_through_a_response,
+        _test_write_pacing_bounds_in_flight_audio,
         _test_set_mic_gain_updates_input_gain,
+        _test_set_mic_gain_not_blocked_by_active_playback,
+        _test_mic_gain_change_applies_to_next_chunk_read,
         _test_skip_calibration_streams_immediately,
         _test_fresh_start_runs_calibration,
         _test_drain_buffered_audio_discards_backlog,

@@ -81,6 +81,33 @@ MAX_PLAYBACK_GAIN = 1.0
 # directions to tune by ear.
 MAX_INPUT_GAIN = 50.0
 
+
+def volume_percent_to_gain(volume: int) -> float:
+    """Map a 0-100 volume slider position onto a playback gain.
+
+    Square-law taper, not linear. Perceived loudness is roughly logarithmic in
+    amplitude, so a linear map crowds nearly all the audible change into the
+    bottom of the travel and leaves the top half feeling like it does nothing.
+    Squaring puts the midpoint at 0.25 amplitude (about -12 dB, which reads as
+    roughly "half as loud") and spreads the change evenly across the slider.
+    100% is still exactly 1.0 -- the source untouched.
+    """
+    pct = max(0, min(100, int(volume))) / 100.0
+    return (pct ** 2) * MAX_PLAYBACK_GAIN
+
+
+def mic_percent_to_gain(mic_gain: int) -> float:
+    """Map a 0-100 mic sensitivity slider position onto a capture gain.
+
+    Deliberately linear, unlike volume. This is a capture trim whose output
+    feeds calibration's measured noise floor and voice peak, not something
+    judged by ear as loudness, and the deployed .env default (INPUT_GAIN=20.0)
+    is hand-tuned to sit at 40% of this range. A perceptual taper would
+    silently re-map that tuned position to 8.0 and break calibration.
+    """
+    pct = max(0, min(100, int(mic_gain))) / 100.0
+    return pct * MAX_INPUT_GAIN
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -393,8 +420,7 @@ class Zero2WClient:
                 if volume is None:
                     logger.warning("SET_VOLUME received with no volume value")
                 else:
-                    pct = max(0, min(100, int(volume))) / 100.0
-                    gain = pct * MAX_PLAYBACK_GAIN
+                    gain = volume_percent_to_gain(volume)
                     self._playback.playback_gain = gain
                     logger.info("Volume set to %s%% (playback_gain=%.2f)", volume, gain)
 
@@ -403,8 +429,7 @@ class Zero2WClient:
                 if mic_gain is None:
                     logger.warning("SET_MIC_GAIN received with no gain value")
                 else:
-                    pct = max(0, min(100, int(mic_gain))) / 100.0
-                    gain = pct * MAX_INPUT_GAIN
+                    gain = mic_percent_to_gain(mic_gain)
                     self._audio_capture.input_gain = gain
                     logger.info("Mic gain set to %s%% (input_gain=%.2f)", mic_gain, gain)
 
@@ -664,10 +689,11 @@ class Zero2WClient:
     async def _playback_worker_loop(self) -> None:
         """Play queued PLAY_AUDIO chunks in order, off the receive loop.
 
-        Gain (SET_VOLUME) is applied per chunk at write time inside
-        PlaybackManager, so a volume change updates every chunk still queued
-        here -- audible within aplay's own buffer rather than only on the next
-        response.
+        Keeping playback off the receive loop is only half of what makes
+        SET_VOLUME live -- it lets the command be *read* promptly. Actually
+        hearing it also needs PlaybackManager to re-read gain per sub-chunk and
+        to pace its writes, or the whole response is already scaled and
+        buffered downstream before it starts playing.
         """
         assert self._playback_queue is not None
         while True:
