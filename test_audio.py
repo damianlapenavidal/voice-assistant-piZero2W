@@ -606,6 +606,44 @@ async def _test_drain_buffered_audio_noop_when_idle():
     print("  PASS: test_drain_buffered_audio_noop_when_idle")
 
 
+async def _test_set_volume_not_blocked_by_active_playback():
+    """A SET_VOLUME is applied even while a PLAY_AUDIO frame is still playing.
+
+    PLAY_AUDIO is drained by a background worker, so the receive loop handles
+    SET_VOLUME immediately instead of stalling behind buffered audio. This is
+    what makes the volume slider respond mid-response, not only once the
+    assistant pauses.
+    """
+    from zero2w_client import MAX_PLAYBACK_GAIN, Zero2WClient
+
+    client = Zero2WClient("ws://test")
+
+    # Make the (background) playback hang so the frame is still "in flight"
+    # while the receive loop moves on to the SET_VOLUME message.
+    gate = asyncio.Event()
+
+    async def _hang(ws, payload):
+        await gate.wait()
+
+    client._handle_play_audio = _hang
+
+    b64 = base64.b64encode(b"\x00\x01" * 10).decode()
+    ws = _FakeWebSocket([
+        json.dumps({"type": "PLAY_AUDIO", "payload": {"audio": b64}}),
+        json.dumps({"type": "SET_VOLUME", "payload": {"volume": 50}}),
+    ])
+
+    await client._receive_loop(ws)
+
+    # The volume landed despite playback never having completed.
+    assert abs(client._playback.playback_gain - 0.5 * MAX_PLAYBACK_GAIN) < 1e-9
+
+    gate.set()
+    await client._stop_playback_worker()
+
+    print("  PASS: test_set_volume_not_blocked_by_active_playback")
+
+
 def run_async_test(coro):
     asyncio.run(coro)
 
@@ -630,6 +668,7 @@ def main():
         _test_finalize_returns_correct_duration,
         _test_streaming_finalize_with_empty_final_chunk,
         _test_set_volume_updates_playback_gain,
+        _test_set_volume_not_blocked_by_active_playback,
         _test_set_mic_gain_updates_input_gain,
         _test_skip_calibration_streams_immediately,
         _test_fresh_start_runs_calibration,

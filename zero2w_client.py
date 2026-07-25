@@ -252,6 +252,12 @@ class Zero2WClient:
         self._calibration_playing_prompt = False
         self._calibration_retries = 0
         self._stream_to_laptop = False
+        # PLAY_AUDIO is drained by a dedicated worker so the receive loop never
+        # blocks on aplay backpressure while the assistant is talking. That
+        # keeps live controls -- SET_VOLUME above all -- responsive mid-speech
+        # instead of only landing once playback drains (i.e. once it pauses).
+        self._playback_queue: asyncio.Queue | None = None
+        self._playback_worker: asyncio.Task | None = None
 
     async def run(self) -> None:
         """Connect to the server and run the main loop.
@@ -403,7 +409,11 @@ class Zero2WClient:
                     logger.info("Mic gain set to %s%% (input_gain=%.2f)", mic_gain, gain)
 
             elif msg_type == "PLAY_AUDIO":
-                await self._handle_play_audio(ws, payload)
+                # Hand off to the playback worker and return immediately so a
+                # SET_VOLUME arriving mid-response isn't stuck behind the queued
+                # audio chunks (which drain only at real-time playback rate).
+                self._ensure_playback_worker()
+                self._playback_queue.put_nowait((ws, payload))
 
             elif msg_type == "MUTE_MIC":
                 self._mic_muted = True
@@ -471,6 +481,8 @@ class Zero2WClient:
     async def _stop_audio(self) -> None:
         """Stop capture task and terminate arecord."""
         self.is_recording = False
+
+        await self._stop_playback_worker()
 
         if self._audio_task is not None:
             self._audio_task.cancel()
@@ -641,6 +653,45 @@ class Zero2WClient:
         self._audio_gating.cancel_calibration()
         await ws.send(make_error(code, message, recoverable=True))
         await self._stop_audio()
+
+    def _ensure_playback_worker(self) -> None:
+        """Start the background PLAY_AUDIO consumer if it isn't running."""
+        if self._playback_worker is not None and not self._playback_worker.done():
+            return
+        self._playback_queue = asyncio.Queue()
+        self._playback_worker = asyncio.create_task(self._playback_worker_loop())
+
+    async def _playback_worker_loop(self) -> None:
+        """Play queued PLAY_AUDIO chunks in order, off the receive loop.
+
+        Gain (SET_VOLUME) is applied per chunk at write time inside
+        PlaybackManager, so a volume change updates every chunk still queued
+        here -- audible within aplay's own buffer rather than only on the next
+        response.
+        """
+        assert self._playback_queue is not None
+        while True:
+            ws, payload = await self._playback_queue.get()
+            try:
+                await self._handle_play_audio(ws, payload)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # never let one frame kill playback
+                logger.error("Playback worker error: %s", exc)
+            finally:
+                self._playback_queue.task_done()
+
+    async def _stop_playback_worker(self) -> None:
+        """Cancel the playback worker and drop any un-played chunks."""
+        worker = self._playback_worker
+        self._playback_worker = None
+        self._playback_queue = None
+        if worker is not None:
+            worker.cancel()
+            try:
+                await worker
+            except asyncio.CancelledError:
+                pass
 
     async def _handle_play_audio(self, ws, payload: dict) -> None:
         """Decode PLAY_AUDIO payload and pipe PCM to aplay."""
