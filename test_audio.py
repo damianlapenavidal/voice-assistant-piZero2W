@@ -16,45 +16,68 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import struct
 
-from audio_capture import CAPTURE_CHANNELS, CHUNK_BYTES, AudioCapture
-from audio_capture import _soft_limit as _capture_soft_limit
+from alsa_mixer import SoftvolControl
+from audio_capture import (
+    CAPTURE_CHANNELS,
+    CAPTURE_MAX_DB,
+    CAPTURE_MIN_DB,
+    CAPTURE_STEPS,
+    CHUNK_BYTES,
+    AudioCapture,
+)
 from audio_playback import (
     BYTE_RATE,
-    SOFTVOL_MIN_DB,
-    SOFTVOL_STEPS,
+    PLAYBACK_MAX_DB,
+    PLAYBACK_MIN_DB,
+    PLAYBACK_STEPS,
     PlaybackManager,
-    gain_to_softvol_index,
 )
 from zero2w_client import make_audio_frame, parse_message
 
 
-def _stereo_pcm(left_values: list[int], right_values: list[int]) -> bytes:
-    """Build interleaved stereo PCM16 bytes: L0 R0 L1 R1 ..."""
-    assert len(left_values) == len(right_values)
-    interleaved = []
-    for left, right in zip(left_values, right_values):
-        interleaved.extend([left, right])
-    return struct.pack(f"<{len(interleaved)}h", *interleaved)
+def _control(min_db: float, max_db: float, steps: int) -> SoftvolControl:
+    """A control with the shipped range, for asking what index a gain maps to."""
+    return SoftvolControl(
+        card="0", control="probe", prime_device="probe",
+        min_db=min_db, max_db=max_db, steps=steps,
+    )
+
+
+_VOLUME = _control(PLAYBACK_MIN_DB, PLAYBACK_MAX_DB, PLAYBACK_STEPS)
+_MIC = _control(CAPTURE_MIN_DB, CAPTURE_MAX_DB, CAPTURE_STEPS)
+
+gain_to_softvol_index = _VOLUME.gain_to_index  # playback: the common case here
 
 
 class _FakeAlsaTool:
-    """Stands in for `amixer`/`aplay`, recording what would have been run.
+    """Stands in for the ALSA tools, recording what would have been run.
 
-    Volume now leaves the process, so tests must intercept it: on the device
-    the real tools exist, and an unpatched test run would leave the speaker
-    at whatever level the last assertion happened to use.
+    Both levels now leave the process, so tests must intercept them: on the
+    device the real tools exist, and an unpatched test run would leave the
+    speaker and the mic at whatever level the last assertion happened to use.
+
+    Patching reaches every module at once -- `audio_capture.asyncio` and
+    `alsa_mixer.asyncio` are the same object -- so this also stands in for
+    the long-lived `aplay`/`arecord` streams when given a `stream_process`.
 
     `mixer_failures` makes that many leading `amixer` calls report failure,
     which is how a device that has not yet created its softvol control
     behaves.
     """
 
-    def __init__(self, *, mixer_failures: int = 0):
+    def __init__(self, *, mixer_failures: int = 0, stream_process=None):
         self.commands: list[list[str]] = []
         self._mixer_failures = mixer_failures
+        self._stream_process = stream_process
 
-    async def __call__(self, *cmd: str, **kwargs) -> MagicMock:
+    async def __call__(self, *cmd: str, **kwargs):
         self.commands.append(list(cmd))
+
+        # Priming opens a `*_prime` PCM; anything else on aplay/arecord is a
+        # real stream, and gets the caller's mock process.
+        if self._stream_process is not None and not self._is_prime(cmd):
+            if cmd[0] in ("aplay", "arecord"):
+                return self._stream_process
 
         returncode = 0
         if cmd[0] == "amixer" and self._mixer_failures > 0:
@@ -65,6 +88,18 @@ class _FakeAlsaTool:
         process.returncode = returncode
         process.communicate = AsyncMock(return_value=(b"", b""))
         return process
+
+    @staticmethod
+    def _is_prime(cmd) -> bool:
+        return any(str(arg).endswith("_prime") for arg in cmd)
+
+    @property
+    def streams_started(self) -> list[list[str]]:
+        """aplay/arecord invocations that were real streams, not priming."""
+        return [
+            cmd for cmd in self.commands
+            if cmd[0] in ("aplay", "arecord") and not self._is_prime(cmd)
+        ]
 
     @property
     def mixer_indexes(self) -> list[int]:
@@ -77,8 +112,8 @@ class _FakeAlsaTool:
 
 
 def _patch_alsa(tool: _FakeAlsaTool):
-    """Route PlaybackManager's ALSA subprocesses to `tool`."""
-    return patch("audio_playback.asyncio.create_subprocess_exec", new=tool)
+    """Route every mixer subprocess -- capture's and playback's -- to `tool`."""
+    return patch("alsa_mixer.asyncio.create_subprocess_exec", new=tool)
 
 
 def test_audio_frame_message_structure():
@@ -127,13 +162,17 @@ def test_audio_frame_chunk_size():
 
 
 async def _test_audio_capture_read_chunk():
-    """read_chunk() reads stereo bytes but returns exactly CHUNK_BYTES (mono, left channel)."""
+    """read_chunk() returns exactly CHUNK_BYTES, exactly as arecord produced them.
+
+    Channel selection and gain both happen upstream in ALSA now, so anything
+    this method did to the samples would be a bug: it would be scaling audio
+    a second time.
+    """
     n = CHUNK_BYTES // 2  # 2 bytes per sample
-    stereo = _stereo_pcm(left_values=[100] * n, right_values=[999] * n)
-    assert len(stereo) == CHUNK_BYTES * CAPTURE_CHANNELS
+    mono = struct.pack(f"<{n}h", *([100] * n))
 
     fake_stdout = asyncio.StreamReader()
-    fake_stdout.feed_data(stereo)
+    fake_stdout.feed_data(mono)
     fake_stdout.feed_eof()
 
     fake_process = MagicMock()
@@ -141,50 +180,57 @@ async def _test_audio_capture_read_chunk():
     fake_process.stdout = fake_stdout
     fake_process.stderr = asyncio.StreamReader()
 
-    capture = AudioCapture(device="plughw:2,0")
+    capture = AudioCapture(device="mic_in", input_gain=4.0)
     capture._process = fake_process
     capture._running = True
 
     chunk = await capture.read_chunk()
-    assert chunk is not None
+    assert chunk == mono, "read_chunk must not touch the samples"
     assert len(chunk) == CHUNK_BYTES
-    # Only the left channel's values (100) survive; the right channel (999) is dropped.
-    assert set(struct.unpack(f"<{n}h", chunk)) == {100}
-    assert capture._build_command()[-2:] == ["-D", "plughw:2,0"]
+    assert capture._build_command()[-2:] == ["-D", "mic_in"]
 
     print("  PASS: test_audio_capture_read_chunk")
 
 
-async def _test_audio_capture_read_chunk_applies_input_gain():
-    """read_chunk() scales left-channel samples by INPUT_GAIN, soft-limited at the ceiling."""
-    n = CHUNK_BYTES // 2
-    stereo = _stereo_pcm(left_values=[10000] * n, right_values=[0] * n)
+async def _test_apply_input_gain_drives_alsa_mixer():
+    """SET_MIC_GAIN becomes an amixer call on the mic's softvol control.
 
-    fake_stdout = asyncio.StreamReader()
-    fake_stdout.feed_data(stereo)
-    fake_stdout.feed_eof()
+    Unlike playback this has to boost, not attenuate: the deployed gain of
+    20 is +26 dB. The index is the one measured from the real plugin.
+    """
+    alsa = _FakeAlsaTool()
+    capture = AudioCapture(input_gain=1.0)
 
-    fake_process = MagicMock()
-    fake_process.returncode = None
-    fake_process.stdout = fake_stdout
-    fake_process.stderr = asyncio.StreamReader()
+    with _patch_alsa(alsa):
+        assert await capture.apply_input_gain(20.0) is True
 
-    capture = AudioCapture(input_gain=4.0)  # 10000 * 4 = 40000, well past the ceiling
-    capture._process = fake_process
-    capture._running = True
+    assert alsa.tools_run == ["amixer"]
+    assert "name=Mic Capture Volume" in alsa.commands[0]
+    assert alsa.mixer_indexes == [231]  # 19.952x on hardware; INPUT_GAIN=20.0
+    assert capture.input_gain == 20.0
 
-    chunk = await capture.read_chunk()
-    values = set(struct.unpack(f"<{n}h", chunk))
-    assert len(values) == 1
-    (result,) = values
-    knee = int(0.85 * 32767)
-    assert knee < result <= 32767  # soft-limited, not hard-clipped flat
+    print("  PASS: test_apply_input_gain_drives_alsa_mixer")
 
-    print("  PASS: test_audio_capture_read_chunk_applies_input_gain")
+
+async def _test_mic_control_is_created_when_missing():
+    """A fresh boot has no mic control either; priming uses arecord, silently."""
+    alsa = _FakeAlsaTool(mixer_failures=1)
+    capture = AudioCapture(input_gain=1.0)
+
+    with _patch_alsa(alsa):
+        assert await capture.apply_input_gain(20.0) is True
+
+    assert alsa.tools_run == ["amixer", "arecord", "amixer"]
+    assert alsa.commands[1][:3] == ["arecord", "-D", "mic_prime"]
+    # --samples=1 so priming returns instantly instead of recording anything.
+    assert "--samples=1" in alsa.commands[1]
+
+    print("  PASS: test_mic_control_is_created_when_missing")
 
 
 async def _test_audio_capture_start_uses_arecord():
-    """start() spawns arecord with S16_LE 24000 Hz, 2-channel (see CAPTURE_CHANNELS) raw format."""
+    """start() spawns arecord with S16_LE 24000 Hz, mono (ALSA already picked
+    the mic's channel -- see CAPTURE_CHANNELS) raw format."""
     mock_process = MagicMock()
     mock_process.returncode = None
     mock_process.stdout = asyncio.StreamReader()
@@ -242,15 +288,16 @@ async def _test_playback_manager_pipes_to_aplay():
 
 
 def _test_gain_to_softvol_index_matches_measured_curve():
-    """An amplitude gain maps onto the softvol step of the same loudness.
+    """An amplitude gain maps onto the softvol step of the same level.
 
     The expected values here are not derived from the implementation: they
-    were measured on the device, by playing a constant tone through the real
-    plugin into a file and reading back the peak at each index. softvol is
-    dB-linear over 0..100 -> -51..0 dB, with index 0 a special case that is
-    exactly silent rather than merely very quiet.
+    were measured on the device, by pushing a known signal through the real
+    plugins and reading back the result at each index. softvol is dB-linear
+    across its range, with index 0 a special case that is exactly silent
+    rather than merely very quiet.
     """
-    assert gain_to_softvol_index(1.0) == SOFTVOL_STEPS  # 0 dB, source untouched
+    # --- playback: 0..100 -> -51..0 dB (attenuation only) ---
+    assert gain_to_softvol_index(1.0) == PLAYBACK_STEPS  # 0 dB, source untouched
     assert gain_to_softvol_index(0.0) == 0  # true silence, measured as zeros
 
     # Measured: index 22 -> 0.0102, index 50 -> 0.0530, index 76 -> ~0.245.
@@ -258,47 +305,34 @@ def _test_gain_to_softvol_index_matches_measured_curve():
     assert gain_to_softvol_index(0.053) == 50  # -25.5 dB
     assert gain_to_softvol_index(0.25) == 76  # -12.0 dB
 
-    # Monotonic, and every step in range.
-    prev = -1
-    for pct in range(0, 101):
-        index = gain_to_softvol_index((pct / 100) ** 2)  # the client's taper
-        assert 0 <= index <= SOFTVOL_STEPS
-        assert index >= prev
-        prev = index
+    # --- capture: 0..255 -> -51..+34 dB, because the mic needs boosting ---
+    assert _MIC.gain_to_index(0.0) == 0
+    assert _MIC.gain_to_index(1.0) == 153  # 0 dB: the plugin's own default
+    assert _MIC.gain_to_index(20.0) == 231  # deployed INPUT_GAIN; measured 19.952x
+    assert _MIC.gain_to_index(50.0) == CAPTURE_STEPS  # +34 dB, top of the mic slider
+
+    # Unity is mid-scale on the mic control, unreachable-past on the volume
+    # one: the two ranges really do point in different directions.
+    assert _MIC.gain_to_index(20.0) > _MIC.gain_to_index(1.0)
+
+    # Monotonic, and every step in range, across both sliders' full travel.
+    for control, gains in (
+        (_VOLUME, [(pct / 100) ** 2 for pct in range(101)]),  # square-law taper
+        (_MIC, [pct / 100 * 50.0 for pct in range(101)]),  # linear taper
+    ):
+        prev = -1
+        for gain in gains:
+            index = control.gain_to_index(gain)
+            assert 0 <= index <= control._steps
+            assert index >= prev
+            prev = index
 
     # Below the plugin's floor but not silent: pinned to the quietest audible
-    # step, never to mute. Turning the slider down must not sound like off.
-    below_floor = 10 ** ((SOFTVOL_MIN_DB - 6) / 20)
-    assert gain_to_softvol_index(below_floor) == 1
+    # step, never to mute. Turning a slider down must not act like off.
+    for control, min_db in ((_VOLUME, PLAYBACK_MIN_DB), (_MIC, CAPTURE_MIN_DB)):
+        assert control.gain_to_index(10 ** ((min_db - 6) / 20)) == 1
 
     print("  PASS: test_gain_to_softvol_index_matches_measured_curve")
-
-
-def _test_soft_limit_shape():
-    """_soft_limit(): passthrough below the knee, smooth + bounded above it."""
-    knee = int(0.85 * 32767)
-
-    # Below the knee: exact passthrough, both signs.
-    assert _capture_soft_limit(1000.0) == 1000
-    assert _capture_soft_limit(-1000.0) == -1000
-    assert _capture_soft_limit(float(knee)) == knee
-
-    # Just past the knee: compressed, but only slightly -- still very close
-    # to the input value, not snapped straight to the ceiling.
-    just_over = _capture_soft_limit(knee + 500.0)
-    assert knee < just_over < knee + 500
-
-    # Monotonic: a louder input never produces a quieter output.
-    prev = 0
-    for magnitude in (0, 5000, 20000, 32767, 50000, 100000):
-        result = _capture_soft_limit(float(magnitude))
-        assert result >= prev
-        prev = result
-
-    # No finite input ever reaches or exceeds the true ceiling.
-    assert _capture_soft_limit(1_000_000.0) <= 32767
-
-    print("  PASS: test_soft_limit_shape")
 
 
 def _test_loud_source_cannot_be_boosted_into_clipping():
@@ -311,9 +345,9 @@ def _test_loud_source_cannot_be_boosted_into_clipping():
     softvol only attenuates, so any gain at or above unity is the same 0 dB
     step and the samples reach the card as they arrived.
     """
-    assert gain_to_softvol_index(1.0) == SOFTVOL_STEPS
+    assert gain_to_softvol_index(1.0) == PLAYBACK_STEPS
     for over_driven in (1.0001, 2.5, 20.0):
-        assert gain_to_softvol_index(over_driven) == SOFTVOL_STEPS
+        assert gain_to_softvol_index(over_driven) == PLAYBACK_STEPS
 
     print("  PASS: test_loud_source_cannot_be_boosted_into_clipping")
 
@@ -599,7 +633,7 @@ async def _test_set_volume_updates_playback_gain():
 
     # Every one of those reached ALSA -- the endpoints as the endpoints.
     assert alsa.mixer_indexes[0] == gain_to_softvol_index(0.49)
-    assert alsa.mixer_indexes[1] == SOFTVOL_STEPS
+    assert alsa.mixer_indexes[1] == PLAYBACK_STEPS
     assert alsa.mixer_indexes[2] == 0
 
     print("  PASS: test_set_volume_updates_playback_gain")
@@ -610,15 +644,20 @@ async def _test_set_mic_gain_updates_input_gain():
     from zero2w_client import MAX_INPUT_GAIN, Zero2WClient
 
     client = Zero2WClient("ws://test")
+    alsa = _FakeAlsaTool()
 
-    ws = _FakeWebSocket([json.dumps({"type": "SET_MIC_GAIN", "payload": {"gain": 40}})])
-    await client._receive_loop(ws)
-    assert abs(client._audio_capture.input_gain - 0.4 * MAX_INPUT_GAIN) < 1e-9
+    with _patch_alsa(alsa):
+        ws = _FakeWebSocket([json.dumps({"type": "SET_MIC_GAIN", "payload": {"gain": 40}})])
+        await client._receive_loop(ws)
+        assert abs(client._audio_capture.input_gain - 0.4 * MAX_INPUT_GAIN) < 1e-9
 
-    # Out-of-range values are clamped, not rejected.
-    ws = _FakeWebSocket([json.dumps({"type": "SET_MIC_GAIN", "payload": {"gain": 150}})])
-    await client._receive_loop(ws)
-    assert abs(client._audio_capture.input_gain - MAX_INPUT_GAIN) < 1e-9
+        # Out-of-range values are clamped, not rejected.
+        ws = _FakeWebSocket([json.dumps({"type": "SET_MIC_GAIN", "payload": {"gain": 150}})])
+        await client._receive_loop(ws)
+        assert abs(client._audio_capture.input_gain - MAX_INPUT_GAIN) < 1e-9
+
+    # Both reached ALSA, and 40% really is the deployed INPUT_GAIN of 20.
+    assert alsa.mixer_indexes == [_MIC.gain_to_index(20.0), CAPTURE_STEPS]
 
     print("  PASS: test_set_mic_gain_updates_input_gain")
 
@@ -716,9 +755,9 @@ async def _test_drain_continuously_keeps_pipe_empty():
     ("aplay pipe broken during final playback").
     """
     fake_stdout = asyncio.StreamReader()
-    # Feed far more than one CHUNK_BYTES*CAPTURE_CHANNELS read would consume,
+    # Feed far more than one CHUNK_BYTES read would consume,
     # simulating arecord producing data continuously in real time.
-    fake_stdout.feed_data(b"\x22" * (CHUNK_BYTES * CAPTURE_CHANNELS * 5))
+    fake_stdout.feed_data(b"\x22" * (CHUNK_BYTES * 5))
 
     fake_process = MagicMock()
     fake_process.returncode = None
@@ -866,9 +905,12 @@ async def _test_set_mic_gain_not_blocked_by_active_playback():
         json.dumps({"type": "SET_MIC_GAIN", "payload": {"gain": 60}}),
     ])
 
-    await client._receive_loop(ws)
+    alsa = _FakeAlsaTool()
+    with _patch_alsa(alsa):
+        await client._receive_loop(ws)
 
     assert abs(client._audio_capture.input_gain - 0.6 * MAX_INPUT_GAIN) < 1e-9
+    assert alsa.mixer_indexes == [_MIC.gain_to_index(0.6 * MAX_INPUT_GAIN)]
 
     gate.set()
     await client._stop_playback_worker()
@@ -876,36 +918,34 @@ async def _test_set_mic_gain_not_blocked_by_active_playback():
     print("  PASS: test_set_mic_gain_not_blocked_by_active_playback")
 
 
-async def _test_mic_gain_change_applies_to_next_chunk_read():
-    """A mid-stream mic gain change affects the very next chunk read.
+async def _test_mic_gain_change_does_not_restart_capture():
+    """A mid-stream mic gain change goes to ALSA, leaving arecord alone.
 
-    Nothing is pre-scaled on the capture side, so there is no equivalent of
-    playback's in-flight buffer: the new gain applies as soon as the next
-    chunk comes off arecord.
+    The gain lands upstream of arecord, on audio not yet captured, so there
+    is nothing to restart and nothing already in flight to re-scale -- and
+    chunks keep arriving byte-for-byte as the hardware produced them.
     """
-    stereo = struct.pack("<4h", 1000, 0, 1000, 0) * (CHUNK_BYTES // 4)
+    mono = struct.pack("<2400h", *([1000] * 2400))
 
     mock_process = MagicMock()
     mock_process.returncode = None
     mock_process.stdout = MagicMock()
-    mock_process.stdout.readexactly = AsyncMock(return_value=stereo)
+    mock_process.stdout.readexactly = AsyncMock(return_value=mono)
     mock_process.stderr = asyncio.StreamReader()
 
-    with patch(
-        "audio_capture.asyncio.create_subprocess_exec",
-        new=AsyncMock(return_value=mock_process),
-    ):
+    alsa = _FakeAlsaTool(stream_process=mock_process)
+    with _patch_alsa(alsa):
         capture = AudioCapture(input_gain=1.0)
         await capture.start()
 
-        first = await capture.read_chunk()
-        assert struct.unpack("<h", first[:2])[0] == 1000
+        assert await capture.read_chunk() == mono
+        await capture.apply_input_gain(3.0)
+        assert await capture.read_chunk() == mono  # unchanged: ALSA did the scaling
 
-        capture.input_gain = 3.0
-        second = await capture.read_chunk()
-        assert struct.unpack("<h", second[:2])[0] == 3000
+    assert alsa.mixer_indexes == [_MIC.gain_to_index(3.0)]
+    assert len(alsa.streams_started) == 1, "capture restarted for a gain change"
 
-    print("  PASS: test_mic_gain_change_applies_to_next_chunk_read")
+    print("  PASS: test_mic_gain_change_does_not_restart_capture")
 
 
 def _test_volume_percent_gain_roundtrip():
@@ -960,9 +1000,12 @@ async def _test_handshake_adopts_app_levels():
     assert abs(client._playback.playback_gain - volume_percent_to_gain(30)) < 1e-9
     assert abs(client._audio_capture.input_gain - 0.6 * MAX_INPUT_GAIN) < 1e-9
 
-    # Adopting the level is not the same as the hardware being at it: softvol
-    # holds whatever it was last set to, across restarts. Push it, once.
-    assert alsa.mixer_indexes == [gain_to_softvol_index(volume_percent_to_gain(30))]
+    # Adopting a level is not the same as the hardware being at it: softvol
+    # holds whatever it was last set to, across restarts. Push both, once.
+    assert alsa.mixer_indexes == [
+        gain_to_softvol_index(volume_percent_to_gain(30)),
+        _MIC.gain_to_index(0.6 * MAX_INPUT_GAIN),
+    ]
 
     # HELLO advertised the device's pre-adoption level so the app can sync too.
     sent = json.loads(ws.sent[0])
@@ -997,9 +1040,10 @@ async def _test_handshake_keeps_own_levels_when_app_sends_none():
         await client._handshake(ws)
         assert client._playback.playback_gain == 0.35
 
-    # The .env level is still pushed to ALSA both times: it is what the device
-    # told the app it was at, so the hardware has to actually be there.
-    assert alsa.mixer_indexes == [gain_to_softvol_index(0.35)] * 2
+    # The .env levels are still pushed to ALSA both times: they are what the
+    # device told the app it was at, so the hardware has to actually be there.
+    default_mic = _MIC.gain_to_index(client._audio_capture.input_gain)
+    assert alsa.mixer_indexes == [gain_to_softvol_index(0.35), default_mic] * 2
 
     print("  PASS: test_handshake_keeps_own_levels_when_app_sends_none")
 
@@ -1014,13 +1058,13 @@ def main():
         test_audio_frame_base64_roundtrip,
         test_audio_frame_chunk_size,
         _test_gain_to_softvol_index_matches_measured_curve,
-        _test_soft_limit_shape,
         _test_loud_source_cannot_be_boosted_into_clipping,
         _test_volume_percent_gain_roundtrip,
     ]
     async_tests = [
         _test_audio_capture_read_chunk,
-        _test_audio_capture_read_chunk_applies_input_gain,
+        _test_apply_input_gain_drives_alsa_mixer,
+        _test_mic_control_is_created_when_missing,
         _test_audio_capture_start_uses_arecord,
         _test_playback_manager_pipes_to_aplay,
         _test_playback_manager_writes_samples_untouched,
@@ -1036,7 +1080,7 @@ def main():
         _test_volume_change_applies_partway_through_a_response,
         _test_set_mic_gain_updates_input_gain,
         _test_set_mic_gain_not_blocked_by_active_playback,
-        _test_mic_gain_change_applies_to_next_chunk_read,
+        _test_mic_gain_change_does_not_restart_capture,
         _test_handshake_adopts_app_levels,
         _test_handshake_keeps_own_levels_when_app_sends_none,
         _test_skip_calibration_streams_immediately,

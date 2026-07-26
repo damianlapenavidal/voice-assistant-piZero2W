@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 import os
+
+from alsa_mixer import SoftvolControl, mixer_card
 
 logger = logging.getLogger(__name__)
 
@@ -36,46 +37,18 @@ DEFAULT_PLAYBACK_GAIN = 1.0
 # needed sub-chunked, wall-clock-paced writes to feel live at all; none of
 # that machinery is necessary now, and it is gone.
 #
-# The plugin, the control it creates and the taper below are defined in
+# The plugin, the control it creates and the range below are defined in
 # `config/asoundrc.softvol`, installed as `~/.asoundrc` on the device. These
 # constants must match that file.
-DEFAULT_MIXER_CARD = "0"
 DEFAULT_MIXER_CONTROL = "PCM Playback Volume"
 DEFAULT_MIXER_PRIME_DEVICE = "softvol_prime"
-# softvol's control index maps to attenuation linearly in dB, with index 0 a
-# special case: exact silence, not merely the quietest step. Verified against
-# the real plugin on the device by playing a constant tone through it into a
-# file and measuring the output at each index.
-SOFTVOL_MIN_DB = -51.0
-SOFTVOL_MAX_DB = 0.0
-SOFTVOL_STEPS = 100  # usable index range is 0..SOFTVOL_STEPS (`resolution 101`)
-
-
-def gain_to_softvol_index(gain: float) -> int:
-    """Linear amplitude gain (0.0-1.0) -> softvol control index.
-
-    The client's volume taper is expressed as an amplitude multiplier -- what
-    the old per-sample multiply consumed -- so it is converted to dB here to
-    reach the same loudness through softvol's dB-linear control.
-
-    Gains above 1.0 pin to 0 dB: softvol cannot boost, which makes playback
-    attenuation-only in the hardware rather than by convention (the reason
-    the old soft-knee limiter on this path is gone -- nothing can now drive a
-    normalized source past full scale).
-
-    Only a gain of exactly 0 maps to the silent index. A gain quieter than
-    the plugin's floor pins to the quietest audible step instead, so "turned
-    down low" never silently becomes "off".
-    """
-    if gain <= 0:
-        return 0
-    if gain >= 1.0:
-        return SOFTVOL_STEPS
-
-    db = 20 * math.log10(gain)
-    span = SOFTVOL_MAX_DB - SOFTVOL_MIN_DB
-    index = round((db - SOFTVOL_MIN_DB) / span * SOFTVOL_STEPS)
-    return max(1, min(SOFTVOL_STEPS, index))
+# 0 dB at the top makes playback attenuation-only in the hardware rather than
+# by convention: softvol cannot boost, so nothing can drive an already
+# normalized source past full scale. That is why the soft-knee limiter this
+# path used to need is gone.
+PLAYBACK_MIN_DB = -51.0
+PLAYBACK_MAX_DB = 0.0
+PLAYBACK_STEPS = 100  # index range 0..PLAYBACK_STEPS (`resolution 101`)
 
 
 class PlaybackError(Exception):
@@ -90,10 +63,15 @@ class PlaybackManager:
         if playback_gain is None:
             playback_gain = float(os.environ.get("PLAYBACK_GAIN", DEFAULT_PLAYBACK_GAIN))
         self._playback_gain = playback_gain
-        self._mixer_card = os.environ.get("AUDIO_MIXER_CARD", DEFAULT_MIXER_CARD)
-        self._mixer_control = os.environ.get("AUDIO_MIXER_CONTROL", DEFAULT_MIXER_CONTROL)
-        self._mixer_prime_device = os.environ.get(
-            "AUDIO_MIXER_PRIME_DEVICE", DEFAULT_MIXER_PRIME_DEVICE,
+        self._volume = SoftvolControl(
+            card=mixer_card(),
+            control=os.environ.get("AUDIO_MIXER_CONTROL", DEFAULT_MIXER_CONTROL),
+            prime_device=os.environ.get(
+                "AUDIO_MIXER_PRIME_DEVICE", DEFAULT_MIXER_PRIME_DEVICE,
+            ),
+            min_db=PLAYBACK_MIN_DB,
+            max_db=PLAYBACK_MAX_DB,
+            steps=PLAYBACK_STEPS,
         )
         self._process: asyncio.subprocess.Process | None = None
         self._streamed_bytes = 0
@@ -123,85 +101,11 @@ class PlaybackManager:
         aplay -- nothing needs to restart and nothing waits for the current
         response to drain.
 
-        Returns whether ALSA accepted it. A failure is logged and swallowed
-        rather than raised: losing a volume change is a far better outcome
-        than losing the session, and this must stay callable on a laptop
-        running the tests, where there is no `amixer` at all.
+        Returns whether ALSA accepted it; see `SoftvolControl.apply_gain` for
+        why a failure is not fatal.
         """
         self._playback_gain = gain
-        index = gain_to_softvol_index(gain)
-
-        # The first attempt is expected to fail once per boot, so it stays
-        # quiet: softvol registers its control the first time the plugin is
-        # opened, and until a sound has played there is nothing to set.
-        # Create the control and retry -- otherwise the level agreed with the
-        # app at handshake would not reach the hardware until the second
-        # response of the session, and the first would play at whatever the
-        # control defaults to, which is full scale.
-        if await self._set_mixer_index(index, quiet=True):
-            return True
-
-        if not await self._prime_mixer_control():
-            return False
-        logger.info("Created ALSA volume control %r", self._mixer_control)
-        return await self._set_mixer_index(index)
-
-    async def _set_mixer_index(self, index: int, *, quiet: bool = False) -> bool:
-        return await self._run_alsa_tool(
-            [
-                "amixer",
-                "-c", self._mixer_card,
-                "-q",
-                "cset", f"name={self._mixer_control}",
-                str(index),
-            ],
-            quiet=quiet,
-        )
-
-    async def _prime_mixer_control(self) -> bool:
-        """Open the softvol chain once, so it registers its mixer control.
-
-        The prime PCM is slaved to `null`, so this creates the control
-        without touching the sound card: it cannot make a sound, and it
-        cannot fail with "device busy" against a playback in progress.
-        """
-        return await self._run_alsa_tool([
-            "aplay",
-            "-D", self._mixer_prime_device,
-            "-f", FORMAT,
-            "-r", str(SAMPLE_RATE),
-            "-c", str(CHANNELS),
-            "-t", "raw",
-            "-q",
-            os.devnull,
-        ])
-
-    async def _run_alsa_tool(self, cmd: list[str], *, quiet: bool = False) -> bool:
-        """Run a short-lived ALSA helper; True if it exited cleanly.
-
-        `quiet` demotes a failure to debug, for the one call whose failure is
-        a normal state rather than a problem.
-        """
-        log = logger.debug if quiet else logger.warning
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        except OSError as exc:  # includes FileNotFoundError: no alsa-utils
-            log("Could not run %s: %s", cmd[0], exc)
-            return False
-
-        _, stderr_data = await process.communicate()
-        if process.returncode != 0:
-            detail = stderr_data.decode("utf-8", errors="replace").strip()
-            log(
-                "%s exited with code %s%s",
-                cmd[0], process.returncode, f": {detail}" if detail else "",
-            )
-            return False
-        return True
+        return await self._volume.apply_gain(gain)
 
     def _build_command(self, *, quiet: bool = False) -> list[str]:
         cmd = [

@@ -64,30 +64,36 @@ aplay   -D plughw:0,0 -f S16_LE -r 24000 -c 1 -t raw /tmp/lb.raw
 You should hear your recorded voice. This exercises the exact format the client
 uses (24 kHz, S16_LE, mono).
 
-## 6. Install the playback volume plugin
+## 6. Install the ALSA plugin chains
 
-The client does not scale playback samples itself — ALSA's `softvol` plugin
-does, which is both far cheaper (a per-sample multiply in Python cost ~10% of
-one core while the assistant spoke) and more responsive (softvol sits
-downstream of `aplay`'s buffer, so a volume change reaches audio already
-committed to it).
+The client does not touch samples itself — ALSA applies both gains and selects
+the mic's channel. That is far cheaper (the two per-sample loops in Python cost
+~25% of one core while the assistant spoke) and, for volume, more responsive:
+`softvol` sits downstream of `aplay`'s buffer, so a change reaches audio
+already committed to it.
 
 ```bash
 cp config/asoundrc.softvol ~/.asoundrc
 ```
 
 Edit the card name in it if yours differs from `sndrpigooglevoi` — it appears
-in both `slave.pcm` and `control.card`. Then check it plays:
+in every `slave.pcm` and `control.card`. Then check both directions:
 
 ```bash
+# playback
 aplay -D softvol_out -f S16_LE -r 24000 -c 1 -t raw assets/say_hello_prompt.pcm
 amixer -c 0 sget PCM       # 0-100, -51.00 dB .. 0.00 dB
 amixer -c 0 cset name='PCM Playback Volume' 40   # audibly quieter
+
+# capture: mono out of a 2-channel card, and a control that boosts
+arecord -D mic_in -f S16_LE -r 24000 -c 1 -t raw -d 3 /tmp/mic.raw
+ls -l /tmp/mic.raw                                # 144000 bytes for 3 s
+amixer -c 0 cset name='Mic Capture Volume' 231    # ~20x, the deployed gain
 ```
 
-The control does not exist until the plugin has been opened once, so run the
-`aplay` before the `amixer`. (The client handles that case itself, by opening a
-silent `softvol_prime` PCM.)
+Neither control exists until its plugin has been opened once, so run the
+`aplay`/`arecord` before the `amixer`. (The client handles that case itself, by
+opening the silent `softvol_prime` / `mic_prime` PCMs.)
 
 ## 7. Write .env
 
@@ -98,17 +104,18 @@ cp .env.example .env
 Set the strings you just validated:
 
 ```ini
-AUDIO_INPUT_DEVICE=plughw:0,0
+AUDIO_INPUT_DEVICE=mic_in
 AUDIO_OUTPUT_DEVICE=softvol_out
 AUDIO_MIXER_CARD=0
 ```
 
-Use the `plughw:` prefix (not raw `hw:`) for capture so ALSA does any needed
-rate/format conversion — `softvol_out` already has one underneath. If capture
-and playback are different cards on your board, set them accordingly.
+Both chains keep a `plughw:` underneath (not raw `hw:`), so ALSA still does any
+needed rate/format conversion. If capture and playback are different cards on
+your board, set `AUDIO_MIC_MIXER_CARD` as well.
 
-To run without the plugin, point `AUDIO_OUTPUT_DEVICE` back at `plughw:0,0`:
-audio plays, at full volume, and the app's volume slider does nothing.
+To run without the plugins, point both back at `plughw:0,0`. Audio still works,
+but at fixed levels: the sliders do nothing, and capture gets the halved
+downmix described in [audio_capture.py](../audio_capture.py).
 
 ## Common issues
 

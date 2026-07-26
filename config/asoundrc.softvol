@@ -1,22 +1,24 @@
-# ALSA playback chain for the voice-assistant client. Install on the device as
+# ALSA audio chains for the voice-assistant client. Install on the device as
 # ~/.asoundrc:
 #
 #     cp config/asoundrc.softvol ~/.asoundrc
 #
-# and point AUDIO_OUTPUT_DEVICE at `softvol_out` in .env.
+# and point AUDIO_OUTPUT_DEVICE at `softvol_out` and AUDIO_INPUT_DEVICE at
+# `mic_in` in .env.
 #
-# Why: playback volume used to be a per-sample multiply in Python, which cost
-# ~10% of one core for as long as the assistant was speaking. `softvol` does
-# the same attenuation in C, inside ALSA. It also lands sooner -- it sits
-# downstream of aplay's buffer, so a volume change affects audio aplay has
-# already accepted, which the Python path could never reach.
+# Why: both gains used to be per-sample multiplies in Python, together ~25% of
+# one core while the assistant was speaking. ALSA does the same arithmetic in
+# C, in the audio chain, for no measurable CPU. Volume also lands sooner:
+# softvol sits downstream of aplay's buffer, so a change affects audio aplay
+# has already accepted, which the Python path could never reach.
 #
 # The `card` below is the I2S card by name, so it survives renumbering. Check
 # yours with `aplay -l`; on a board with a different card, change it here and
-# in `slave.pcm` together.
+# in each `slave.pcm` together.
 #
-# To revert: delete this file from ~ and set AUDIO_OUTPUT_DEVICE back to
-# plughw:CARD=sndrpigooglevoi,DEV=0. Nothing else depends on it.
+# To revert: delete this file from ~ and set AUDIO_OUTPUT_DEVICE and
+# AUDIO_INPUT_DEVICE back to plughw:CARD=sndrpigooglevoi,DEV=0. Nothing else
+# depends on it.
 
 # The device the client plays through. `plughw:` stays underneath so ALSA
 # still converts 24 kHz mono S16_LE to whatever the card wants.
@@ -58,4 +60,57 @@ pcm.softvol_prime {
     min_dB -51.0
     max_dB 0.0
     resolution 101
+}
+
+# --- capture -------------------------------------------------------------
+
+# The I2S mic is genuinely 2-channel: it occupies the left slot and the right
+# slot is silent by design. Asking `plughw:` for one channel makes it downmix
+# by averaging the two, halving an already-quiet signal -- so the client used
+# to capture both channels and drop the right one in Python. `route` selects
+# the left slot in C instead, and arecord then carries half the bytes.
+#
+# ttable.0.0 means "client channel 0 takes slave channel 0". Verified on the
+# device by feeding a file of known L/R values through it: L came out, and
+# nothing else did.
+pcm.mic_left {
+    type route
+    slave { pcm "plughw:CARD=sndrpigooglevoi,DEV=0" channels 2 }
+    ttable.0.0 1
+}
+
+# Mic gain. Unlike playback this has to *boost*: the mic's raw signal peaks
+# around 0.5% of full scale, so the useful range runs well above unity.
+# +34 dB is a gain of ~50, the top of the client's mic slider
+# (MAX_INPUT_GAIN); index 0 is still exact silence. 256 steps keep the
+# quantisation error under 0.25% at the deployed INPUT_GAIN of 20 -- worth
+# it, because calibration thresholds are measured against these levels.
+#
+# Note this saturates at the ceiling where the Python path soft-limited. See
+# audio_capture.py for why that only ever mattered for arecord's first chunk.
+pcm.mic_in {
+    type softvol
+    slave.pcm "mic_left"
+    control {
+        name "Mic Capture Volume"
+        card "sndrpigooglevoi"
+    }
+    min_dB -51.0
+    max_dB 34.0
+    resolution 256
+}
+
+# Capture-side twin of softvol_prime, for the same reason: creates the mic
+# control without opening the card. Every field except the slave must match
+# mic_in exactly -- they are two routes to one control.
+pcm.mic_prime {
+    type softvol
+    slave.pcm "null"
+    control {
+        name "Mic Capture Volume"
+        card "sndrpigooglevoi"
+    }
+    min_dB -51.0
+    max_dB 34.0
+    resolution 256
 }

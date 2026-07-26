@@ -1,12 +1,18 @@
-"""Microphone capture via arecord subprocess (24 kHz PCM16, mono left channel)."""
+"""Microphone capture via arecord subprocess (24 kHz PCM16, mono left channel).
+
+Neither the channel selection nor the gain happens here. Both are ALSA's
+work now -- a `route` plugin picks the mic's channel out of the I2S frame and
+a `softvol` control applies the gain, so this module only moves bytes. See
+`config/asoundrc.softvol` and `alsa_mixer`.
+"""
 
 from __future__ import annotations
 
-import array
 import asyncio
 import logging
-import math
 import os
+
+from alsa_mixer import SoftvolControl, mixer_card
 
 logger = logging.getLogger(__name__)
 
@@ -16,61 +22,33 @@ BYTES_PER_SAMPLE = 2
 
 # The I2S hardware (ICS-43434-class mic) is genuinely 2-channel: the mic
 # occupies the left slot and the right slot is silent by design. Requesting
-# `-c 1` directly from ALSA lets the `plughw:` plug plugin downmix by
-# averaging left+right, which halves the already-quiet mic signal. Capturing
-# both channels and keeping only the left one avoids that loss.
-CAPTURE_CHANNELS = 2
+# `-c 1` from `plughw:` lets the plug plugin downmix by averaging left+right,
+# which halves the already-quiet mic signal. The `route` plugin in
+# AUDIO_INPUT_DEVICE selects the left slot instead, so arecord hands us mono
+# with no loss -- and half the bytes, since the silent slot never crosses the
+# pipe.
+CAPTURE_CHANNELS = 1
 
 CHUNK_BYTES = 4800  # 100 ms at 24 kHz mono S16_LE -- the size callers expect
-_CAPTURE_CHUNK_BYTES = CHUNK_BYTES * CAPTURE_CHANNELS  # raw stereo bytes for the same 100 ms
 
 DEFAULT_INPUT_GAIN = 1.0
-_INT16_MAX = 32767
-_INT16_MIN = -32768
-# Soft-knee limiter: below this fraction of full scale, gain is applied with
-# no shaping at all. Above it, the excess compresses asymptotically toward
-# the ceiling instead of hard-clipping. A gain tuned for a quiet source (this
-# mic's raw signal is very quiet) can massively over-drive a louder one --
-# hard-clipping that would produce an audible, harsh "click" per sample over
-# the ceiling; this rounds it off smoothly instead.
-_LIMITER_KNEE_FRACTION = 0.85
 
-
-def _soft_limit(value: float) -> int:
-    """Gain-scaled sample -> int16, softly compressing anything past the knee."""
-    sign = 1.0 if value >= 0 else -1.0
-    magnitude = abs(value)
-    knee = _LIMITER_KNEE_FRACTION * _INT16_MAX
-    if magnitude <= knee:
-        limited = magnitude
-    else:
-        headroom = _INT16_MAX - knee
-        over = magnitude - knee
-        limited = knee + headroom * (1 - math.exp(-over / headroom))
-    result = sign * limited
-    if result > _INT16_MAX:
-        result = _INT16_MAX
-    elif result < _INT16_MIN:
-        result = _INT16_MIN
-    return int(result)
-
-
-def _left_channel_with_gain(stereo_pcm: bytes, gain: float) -> bytes:
-    """Extract the left channel from interleaved stereo PCM16 and apply gain.
-
-    Passed through a soft-knee limiter (see `_soft_limit`) rather than a hard
-    clip, so an over-driven gain rounds loud peaks off smoothly instead of
-    producing an audible, harsh clipping artifact.
-    """
-    samples = array.array("h")
-    samples.frombytes(stereo_pcm)
-    left = samples[0::2]
-
-    if gain != 1.0:
-        for i, value in enumerate(left):
-            left[i] = _soft_limit(value * gain)
-
-    return left.tobytes()
+# The mic's raw signal is very quiet by hardware design, so this control
+# boosts rather than attenuates: +34 dB is a gain of ~50, matching the top of
+# the client's mic slider. See `config/asoundrc.softvol`; these must agree.
+#
+# One behaviour change comes with it. The Python path soft-limited peaks past
+# 85% of full scale; ALSA saturates at the ceiling instead. Measured on this
+# hardware, that only ever mattered for the transient in arecord's first
+# chunk (raw peak ~1755, i.e. past the ceiling once multiplied): steady-state
+# room noise sits near 80-100 raw and speech well under that ceiling, so the
+# knee never engaged in normal use. Calibration already ignores that first
+# chunk -- `_observe_quiet` only lowers the noise floor toward *quiet* chunks.
+CAPTURE_MIN_DB = -51.0
+CAPTURE_MAX_DB = 34.0
+CAPTURE_STEPS = 255  # index range 0..CAPTURE_STEPS (`resolution 256`)
+DEFAULT_MIC_MIXER_CONTROL = "Mic Capture Volume"
+DEFAULT_MIC_MIXER_PRIME_DEVICE = "mic_prime"
 
 
 class AudioCaptureError(Exception):
@@ -80,9 +58,8 @@ class AudioCaptureError(Exception):
 class AudioCapture:
     """Capture raw PCM16 audio using an arecord subprocess.
 
-    Captures the hardware's native 2 channels and returns only the left
-    channel (mono, ``CHUNK_BYTES`` per chunk), with an optional software gain
-    applied and clipped.
+    Reads mono chunks of ``CHUNK_BYTES``: the mic's channel is selected and
+    its gain applied inside ALSA, upstream of arecord.
     """
 
     def __init__(self, device: str | None = None, *, input_gain: float | None = None):
@@ -90,6 +67,17 @@ class AudioCapture:
         if input_gain is None:
             input_gain = float(os.environ.get("INPUT_GAIN", DEFAULT_INPUT_GAIN))
         self._input_gain = input_gain
+        self._gain_control = SoftvolControl(
+            card=os.environ.get("AUDIO_MIC_MIXER_CARD") or mixer_card(),
+            control=os.environ.get("AUDIO_MIC_MIXER_CONTROL", DEFAULT_MIC_MIXER_CONTROL),
+            prime_device=os.environ.get(
+                "AUDIO_MIC_MIXER_PRIME_DEVICE", DEFAULT_MIC_MIXER_PRIME_DEVICE,
+            ),
+            min_db=CAPTURE_MIN_DB,
+            max_db=CAPTURE_MAX_DB,
+            steps=CAPTURE_STEPS,
+            capture=True,
+        )
         self._process: asyncio.subprocess.Process | None = None
         self._running = False
 
@@ -99,13 +87,20 @@ class AudioCapture:
 
     @property
     def input_gain(self) -> float:
+        """The gain last handed to ALSA (or the .env startup value).
+
+        Kept so the client can report the device's level to the app in HELLO;
+        the audio itself is scaled by softvol, not by this number.
+        """
         return self._input_gain
 
-    @input_gain.setter
-    def input_gain(self, value: float) -> None:
-        """Update gain live (e.g. from a SET_MIC_GAIN command); takes effect
-        on the next chunk read -- capture does not need to restart."""
-        self._input_gain = value
+    async def apply_input_gain(self, gain: float) -> bool:
+        """Set the ALSA mic gain (e.g. from SET_MIC_GAIN).
+
+        Takes effect on audio not yet captured; arecord does not restart.
+        """
+        self._input_gain = gain
+        return await self._gain_control.apply_gain(gain)
 
     def _build_command(self) -> list[str]:
         cmd = [
@@ -164,7 +159,7 @@ class AudioCapture:
             logger.debug("arecord stderr on stop: %s", stderr.strip())
 
     async def read_chunk(self) -> bytes | None:
-        """Read one fixed-size mono chunk: left channel only, gain-adjusted."""
+        """Read one fixed-size mono chunk, already channel-selected and gained."""
         if not self.is_running or self._process is None or self._process.stdout is None:
             return None
 
@@ -173,12 +168,10 @@ class AudioCapture:
             return None
 
         try:
-            stereo_chunk = await self._process.stdout.readexactly(_CAPTURE_CHUNK_BYTES)
+            return await self._process.stdout.readexactly(CHUNK_BYTES)
         except asyncio.IncompleteReadError:
             self._running = False
             return None
-
-        return _left_channel_with_gain(stereo_chunk, self._input_gain)
 
     async def drain_continuously(self) -> None:
         """Keep consuming arecord's stdout until cancelled; discards everything.
@@ -200,7 +193,7 @@ class AudioCapture:
             return
         try:
             while True:
-                data = await self._process.stdout.read(_CAPTURE_CHUNK_BYTES)
+                data = await self._process.stdout.read(CHUNK_BYTES)
                 if not data:
                     return
         except asyncio.CancelledError:
@@ -225,7 +218,7 @@ class AudioCapture:
         while loop.time() < deadline:
             try:
                 data = await asyncio.wait_for(
-                    self._process.stdout.read(_CAPTURE_CHUNK_BYTES),
+                    self._process.stdout.read(CHUNK_BYTES),
                     timeout=0.05,
                 )
             except asyncio.TimeoutError:

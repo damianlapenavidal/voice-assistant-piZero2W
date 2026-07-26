@@ -34,7 +34,13 @@ from pathlib import Path
 from audio_capture import AudioCapture, AudioCaptureError, CHUNK_BYTES
 from audio_gating import AudioGating, CalibrationPhase, CalibrationStep
 from audio_playback import PlaybackError, PlaybackManager
-from calibration_prompt import PROMPT_TEXT, get_calibration_prompt_pcm, prompt_asset_status
+from calibration_prompt import (
+    PROMPT_TEXT,
+    CalibrationPromptError,
+    get_calibration_prompt_pcm,
+    prompt_asset_ok,
+    prompt_asset_status,
+)
 
 try:
     import websockets
@@ -454,29 +460,33 @@ class Zero2WClient:
                     )
                 break
 
+        adopted_mic_gain: float | None = None
         for source in (audio_config, payload):
             mic_gain = source.get("mic_gain")
             if mic_gain is not None:
                 try:
-                    gain = mic_percent_to_gain(mic_gain)
+                    adopted_mic_gain = mic_percent_to_gain(mic_gain)
                 except (TypeError, ValueError):
                     logger.warning("Ignoring unusable mic_gain in HELLO_ACK: %r", mic_gain)
-                    break
-                self._audio_capture.input_gain = gain
-                logger.info(
-                    "Adopted app mic gain %s%% (input_gain=%.2f)", mic_gain, gain,
-                )
+                else:
+                    logger.info(
+                        "Adopted app mic gain %s%% (input_gain=%.2f)",
+                        mic_gain, adopted_mic_gain,
+                    )
                 break
 
-        # Push the volume that stands -- the app's if it sent a usable one,
-        # otherwise the .env fallback we advertised in HELLO -- into ALSA
-        # unconditionally. The softvol control keeps whatever it was last set
-        # to, across client restarts and (via alsactl) reboots, so agreeing a
-        # level with the app is not the same as the hardware being at it.
-        # This is also where the control gets created on a fresh boot.
-        # (Mic gain needs no equivalent: it is still applied in this process.)
+        # Push the levels that stand -- the app's where it sent usable ones,
+        # otherwise the .env fallbacks we advertised in HELLO -- into ALSA
+        # unconditionally. Both softvol controls keep whatever they were last
+        # set to, across client restarts and (via alsactl) reboots, so
+        # agreeing a level with the app is not the same as the hardware being
+        # at it. This is also where the controls get created on a fresh boot.
         await self._playback.apply_playback_gain(
             adopted_volume if adopted_volume is not None else self._playback.playback_gain,
+        )
+        await self._audio_capture.apply_input_gain(
+            adopted_mic_gain if adopted_mic_gain is not None
+            else self._audio_capture.input_gain,
         )
 
     async def _status_loop(self, ws) -> None:
@@ -521,7 +531,7 @@ class Zero2WClient:
                     logger.warning("SET_MIC_GAIN received with no gain value")
                 else:
                     gain = mic_percent_to_gain(mic_gain)
-                    self._audio_capture.input_gain = gain
+                    await self._audio_capture.apply_input_gain(gain)
                     logger.info("Mic gain set to %s%% (input_gain=%.2f)", mic_gain, gain)
 
             elif msg_type == "PLAY_AUDIO":
@@ -709,7 +719,7 @@ class Zero2WClient:
             # the prompt's own "...to start" tail and treats it as the user's
             # hello — calibration then "completes" even in total silence.
             await asyncio.sleep(PROMPT_SETTLE_SEC)
-        except (PlaybackError, RuntimeError, OSError) as exc:
+        except (PlaybackError, CalibrationPromptError, RuntimeError, OSError) as exc:
             logger.error("Calibration prompt playback failed: %s", exc)
             await ws.send(make_error("SPEAKER_ERROR", str(exc), recoverable=True))
             return False
@@ -903,7 +913,14 @@ def main():
         os.environ.get("AUDIO_INPUT_DEVICE", "(default)"),
         os.environ.get("AUDIO_OUTPUT_DEVICE", "(default)"),
     )
-    logger.info("Calibration prompt asset: %s", prompt_asset_status())
+    # Loud at startup rather than quiet until the first session: without this
+    # asset calibration cannot run at all, and there is no synthesis fallback
+    # (see calibration_prompt). Not fatal -- a resumed session skips
+    # calibration, so the device is still useful.
+    if prompt_asset_ok():
+        logger.info("Calibration prompt asset: %s", prompt_asset_status())
+    else:
+        logger.error("Calibration prompt asset: %s", prompt_asset_status())
 
     client = Zero2WClient(args.server_url)
 
