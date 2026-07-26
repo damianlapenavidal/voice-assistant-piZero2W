@@ -69,11 +69,14 @@ PROMPT_SETTLE_SEC = 0.6
 # client plays -- the calibration prompt asset and OpenAI's TTS -- is already
 # normalized and near full scale, so volume is pure attenuation: 100% == the
 # source untouched (the loudest a normalized signal is meant to play), lower
-# values scale it down. Capping at unity keeps the soft-knee limiter from ever
-# engaging on these sources, which is what made the slider inert above ~30%:
-# gains >1.0 drove loud TTS into the knee, compressing the whole upper half of
-# the slider into the ceiling. (The old range boosted above unity for a quiet
-# raw-mic loopback source that this thin client no longer has.)
+# values scale it down. Boosting above unity is what made the slider inert
+# above ~30%: it drove loud TTS into a soft-knee limiter, compressing the
+# whole upper half of the slider into the ceiling. (The old range boosted for
+# a quiet raw-mic loopback source that this thin client no longer has.)
+#
+# ALSA's softvol now enforces the cap rather than merely honouring it: it
+# attenuates and cannot boost, so unity is the top of the range by
+# construction. See `gain_to_softvol_index`.
 MAX_PLAYBACK_GAIN = 1.0
 # SET_MIC_GAIN's 0-100 range maps onto [0, MAX_INPUT_GAIN]. Measured raw mic
 # signal on this hardware peaks around 0.5% of full scale, so meaningful
@@ -424,9 +427,9 @@ class Zero2WClient:
             "Handshake complete! session_id=%s, audio_config=%s",
             self.session_id, audio_config,
         )
-        self._adopt_initial_levels(payload, audio_config)
+        await self._adopt_initial_levels(payload, audio_config)
 
-    def _adopt_initial_levels(self, payload: dict, audio_config: dict) -> None:
+    async def _adopt_initial_levels(self, payload: dict, audio_config: dict) -> None:
         """Take the app's remembered slider positions, if it sent any.
 
         The app is the source of truth for levels the user has set: those
@@ -436,18 +439,19 @@ class Zero2WClient:
         jumping the volume. Silently ignored if the app sends nothing, in
         which case the levels we advertised in HELLO stand.
         """
+        adopted_volume: float | None = None
         for source in (audio_config, payload):
             volume = source.get("volume")
             if volume is not None:
                 try:
-                    gain = volume_percent_to_gain(volume)
+                    adopted_volume = volume_percent_to_gain(volume)
                 except (TypeError, ValueError):
                     logger.warning("Ignoring unusable volume in HELLO_ACK: %r", volume)
-                    break
-                self._playback.playback_gain = gain
-                logger.info(
-                    "Adopted app volume %s%% (playback_gain=%.2f)", volume, gain,
-                )
+                else:
+                    logger.info(
+                        "Adopted app volume %s%% (playback_gain=%.2f)",
+                        volume, adopted_volume,
+                    )
                 break
 
         for source in (audio_config, payload):
@@ -463,6 +467,17 @@ class Zero2WClient:
                     "Adopted app mic gain %s%% (input_gain=%.2f)", mic_gain, gain,
                 )
                 break
+
+        # Push the volume that stands -- the app's if it sent a usable one,
+        # otherwise the .env fallback we advertised in HELLO -- into ALSA
+        # unconditionally. The softvol control keeps whatever it was last set
+        # to, across client restarts and (via alsactl) reboots, so agreeing a
+        # level with the app is not the same as the hardware being at it.
+        # This is also where the control gets created on a fresh boot.
+        # (Mic gain needs no equivalent: it is still applied in this process.)
+        await self._playback.apply_playback_gain(
+            adopted_volume if adopted_volume is not None else self._playback.playback_gain,
+        )
 
     async def _status_loop(self, ws) -> None:
         """Send DEVICE_STATUS messages at a regular interval."""
@@ -495,7 +510,9 @@ class Zero2WClient:
                     logger.warning("SET_VOLUME received with no volume value")
                 else:
                     gain = volume_percent_to_gain(volume)
-                    self._playback.playback_gain = gain
+                    # Reaches the speaker immediately, including audio already
+                    # inside aplay: softvol sits downstream of its buffer.
+                    await self._playback.apply_playback_gain(gain)
                     logger.info("Volume set to %s%% (playback_gain=%.2f)", volume, gain)
 
             elif msg_type == "SET_MIC_GAIN":
@@ -763,11 +780,11 @@ class Zero2WClient:
     async def _playback_worker_loop(self) -> None:
         """Play queued PLAY_AUDIO chunks in order, off the receive loop.
 
-        Keeping playback off the receive loop is only half of what makes
-        SET_VOLUME live -- it lets the command be *read* promptly. Actually
-        hearing it also needs PlaybackManager to re-read gain per sub-chunk and
-        to pace its writes, or the whole response is already scaled and
-        buffered downstream before it starts playing.
+        This is what makes SET_VOLUME live. The command has to be *read*
+        promptly, and a whole response is written to aplay in one go, so a
+        receive loop that also played audio would sit in `drain()` for the
+        length of the response. Applying the volume once read is ALSA's
+        problem, not this loop's -- softvol reaches audio already buffered.
         """
         assert self._playback_queue is not None
         while True:

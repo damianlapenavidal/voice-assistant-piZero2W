@@ -1,0 +1,61 @@
+# ALSA playback chain for the voice-assistant client. Install on the device as
+# ~/.asoundrc:
+#
+#     cp config/asoundrc.softvol ~/.asoundrc
+#
+# and point AUDIO_OUTPUT_DEVICE at `softvol_out` in .env.
+#
+# Why: playback volume used to be a per-sample multiply in Python, which cost
+# ~10% of one core for as long as the assistant was speaking. `softvol` does
+# the same attenuation in C, inside ALSA. It also lands sooner -- it sits
+# downstream of aplay's buffer, so a volume change affects audio aplay has
+# already accepted, which the Python path could never reach.
+#
+# The `card` below is the I2S card by name, so it survives renumbering. Check
+# yours with `aplay -l`; on a board with a different card, change it here and
+# in `slave.pcm` together.
+#
+# To revert: delete this file from ~ and set AUDIO_OUTPUT_DEVICE back to
+# plughw:CARD=sndrpigooglevoi,DEV=0. Nothing else depends on it.
+
+# The device the client plays through. `plughw:` stays underneath so ALSA
+# still converts 24 kHz mono S16_LE to whatever the card wants.
+pcm.softvol_out {
+    type softvol
+    slave.pcm "plughw:CARD=sndrpigooglevoi,DEV=0"
+    control {
+        name "PCM Playback Volume"
+        card "sndrpigooglevoi"
+    }
+    # Index 0 is exact silence; 1..100 spans -51.00 dB to 0.00 dB in 0.51 dB
+    # steps. 0 dB at the top makes playback attenuation-only -- softvol cannot
+    # boost -- which is the policy the client already followed by convention.
+    # audio_playback.gain_to_softvol_index() converts the client's amplitude
+    # gain to an index using these exact numbers; change them together.
+    min_dB -51.0
+    max_dB 0.0
+    resolution 101
+}
+
+# Same control, no hardware: opening this is how the client creates the mixer
+# control on a freshly booted device.
+#
+# softvol registers its control the first time the plugin is opened, so before
+# any sound has played there is nothing for `amixer` to set -- and the level
+# the client agreed with the app at handshake would not reach the hardware
+# until the second response of the session. Slaved to `null` so priming is
+# silent and can never collide with a playback in progress.
+#
+# Every field except the slave must match softvol_out exactly: they are two
+# routes to one control.
+pcm.softvol_prime {
+    type softvol
+    slave.pcm "null"
+    control {
+        name "PCM Playback Volume"
+        card "sndrpigooglevoi"
+    }
+    min_dB -51.0
+    max_dB 0.0
+    resolution 101
+}

@@ -104,7 +104,8 @@ cd voice-assistant-piZero2W
 sudo apt install alsa-utils
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env         # set AUDIO_INPUT_DEVICE / AUDIO_OUTPUT_DEVICE to your card
+cp config/asoundrc.softvol ~/.asoundrc   # ALSA-side playback volume; edit the card name
+cp .env.example .env         # set AUDIO_INPUT_DEVICE / AUDIO_MIXER_CARD to your card
 ```
 
 **Checkpoint:** `python test_client.py` and `python test_audio.py` pass on the
