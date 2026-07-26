@@ -186,6 +186,75 @@ the bytes (one channel, not two). Playback's ~10% went the same way in 2a.
 > `INPUT_GAIN=20` does, so 15.16 ms was if anything an under-estimate. The
 > whole-process numbers here are the ones to trust.
 
+### Echo and voice levels (2026-07-26)
+
+Measured to answer one question: can the mic stay open while the assistant
+speaks, so the user can interrupt? All figures are mic RMS at the deployed
+`INPUT_GAIN=20`, i.e. the numbers the client itself sees. The stimulus is the
+prompt asset — real speech, which is what TTS sounds like.
+
+| Playback volume | Plugin | Ambient | Echo RMS | Echo 20 ms peak | Over ambient |
+| --- | --- | --- | --- | --- | --- |
+| **100** (deployed `PLAYBACK_GAIN=1.0`) | 0.0 dB | 519 | **8241** | ~25 500 | **+24.0 dB** |
+| 83 (app slider 60%) | −8.7 dB | 521 | 3359 | 11 792 | +16.2 dB |
+| 76 (slider 50%) | −12.2 dB | 561 | 2314 | 8069 | +12.3 dB |
+| 50 (slider ~22%) | −25.5 dB | 552 | 622 | 1080 | +1.0 dB |
+| 22 | −39.8 dB | 544 | 521 | 729 | −0.4 dB |
+
+Against a 6 s voice recording taken at the user's position:
+
+| | RMS at 20× gain |
+| --- | --- |
+| ambient (quiet third) | 584 |
+| speech (loudest quarter) | **1880** |
+| loudest 100 ms window | 2577 |
+| raw sample peak | 398 → 7941 after gain (**no clipping**) |
+
+Speech sits only **+10.2 dB** over the room. Margin against the echo above:
+**−12.8 dB at volume 100, −5.0 at 83, −1.8 at 76, +9.6 at 50, +11.1 at 22.**
+
+Five things follow.
+
+1. **At the deployed volume, a level threshold cannot work.** The echo is
+   12.8 dB *louder* than the voice, and its 20 ms peaks (~25 500) are near
+   full scale, so the capture path is clipping. Clipping is non-linear, which
+   also puts it beyond what an echo canceller could subtract.
+2. **Ducking is linear and has no crosstalk floor.** Predicted-versus-measured
+   tracks within 0.8–1.6 dB down to −12 dB, and by −25 dB the echo has
+   disappeared into the mic's own noise (+1.0 dB over ambient). Nothing leaks
+   through the shared I2S bus electrically.
+3. **You must duck to about −25 dB (index ~50) to hear the user** — which is
+   nearly to silence. Continuous listening at a comfortable volume is not
+   available from level thresholds alone.
+4. **The acoustic tail is under 50 ms.** Even a burst stopping at full
+   amplitude is back within 3 dB of ambient in the first 20 ms window. So an
+   AEC filter would be short, and after ducking the mic is trustworthy almost
+   at once. `PROMPT_SETTLE_SEC = 0.6` is conservative by roughly 4×.
+5. **The amp is not the noise floor.** Opening a playback stream and feeding
+   it pure zeros moved the mic floor by +0.2 dB. Gating the amp's SD_MODE pin
+   would still save power, but it buys no SNR.
+
+> **Two caveats on this data.** A 440 Hz tone burst produced ~8 dB *less* echo
+> than speech at the same RMS — small drivers barely radiate 440 Hz, so tone
+> tests understate this badly; only the speech figures are quoted above. And
+> the voice sample is one recording of one (adult) speaker at one distance. A
+> child at the same spot may well be quieter, so treat +10.2 dB as the
+> optimistic end.
+
+### Capture format (resolves the `S32_LE` loose end in §6)
+
+`hw:0,0` is **S32_LE / 48 kHz / 2ch only**. When the client asks `plughw` for
+S16_LE / 24 kHz, the hardware still runs S32/48k and `plug` resamples and
+truncates to 16 bits — *before* route, softvol, or Python sees anything. So
+the mic's quiet signal (peaks ~0.5% of full scale) is quantised to roughly 8
+usable bits before any gain is applied, in every design considered so far.
+
+That matters for everything below: SNR is the currency both barge-in and voice
+gating spend. Applying the gain in the 32-bit domain — `route` and `softvol`
+at S32/48k straight off `hw`, with `plug` on the *outside* converting after
+the boost — would recover about 4 bits. It is a `.asoundrc` reordering now
+that the chain exists. Untested; worth an hour before either phase below.
+
 ### Constraints found while measuring
 
 - **The Pi runs Python 3.13.5**, which **removed `audioop`**. The obvious C-speed
@@ -383,16 +452,145 @@ Effort: 1-2 days. Risk: high. Do it last, behind a flag.
 
 ---
 
+### Phase 6 — Barge-in: letting the user interrupt (post-demo)
+
+The mic is muted while the assistant speaks, so the child cannot interrupt.
+Fixing that is an echo problem, and §3 measured it.
+
+**There is no hardware answer on this board.** The intuition — "we know what
+we sent, subtract it" — fails because what reaches the mic is that signal
+convolved with the enclosure (tens of ms of tail), delayed by aplay's buffer,
+and distorted non-linearly by a class-D amp driving a 3 Ω speaker. The mic is
+a digital I2S part, so there is no analog node to inject an inverted signal
+into, and ALSA ships no echo canceller (`route` and `softvol` are per-sample
+arithmetic on one stream; cancellation needs two, plus a delay estimate and an
+adaptive filter). Real hardware AEC exists — XMOS VocalFusion-class parts that
+take a loopback reference — but that is a new component, not a config change.
+
+One thing about this build *is* favourable: mic and amp share BCLK and LRCLK,
+so capture and playback are **sample-clock-locked** and the echo delay is
+fixed. That is the hard part of AEC handed over for free, and it is why the
+device is better-conditioned for AEC than the laptop, despite having ~50× less
+CPU — over Wi-Fi the two streams have independent clocks and jitter.
+
+Four approaches, cheapest first:
+
+**6a. Listen in the gaps.** TTS is full of pauses. The tail is <50 ms, so
+during any pause longer than ~150 ms the echo has already fallen to the noise
+floor and the mic is usable at full volume. The app knows where the pauses are
+— it holds the audio it is sending. No ducking, no AEC, no new hardware.
+Effort: ~1 day, app-side. Risk: low. Detects only interruptions that begin
+during a gap, which for a chatty model is most of them.
+
+**6b. Duck-then-listen.** Drop the volume when the app wants to allow an
+interruption; §3 says −25 dB clears the echo entirely, and 2a made a volume
+change reach audio *already buffered in aplay*. The catch from §3 is that
+−25 dB is nearly inaudible, so this is a brief "am I being interrupted?"
+probe, not a listening posture. Effort: ~1 day across both repos. Risk: low.
+
+**6c. Threshold against predicted echo.** Instead of a fixed threshold,
+compare the mic against the echo the app *expects* right now — it has the
+reference signal and, from §3, the coupling. Worth perhaps 6–10 dB over 6b
+and costs no new dependency. Effort: 2–3 days. Risk: medium; needs the
+reference aligned to what is actually leaving the speaker.
+
+**6d. Real AEC.** speexdsp's canceller is the light option; webrtc-audio-
+processing is better and heavier. The blocker is not the filter, it is
+alignment: aligning the reference needs `snd_pcm_delay()`, and the client
+pipes to `aplay` as a subprocess, so **the whole subprocess-and-pipe design
+would have to become a real ALSA binding**. Also no numpy and no `audioop` on
+the device, so this is a C dependency, not Python. Effort: a week, plus a
+refactor of code we just tuned. Risk: high. Do not start here.
+
+> **Barge-in costs battery, and the plan should say so out loud.** Keeping the
+> mic open during responses means streaming audio while the assistant talks —
+> roughly doubling radio time per response, against everything Phase 4 and 5
+> are for. 6a is the cheapest in this respect too, since it only listens in
+> gaps. Price this against Phase 1's current draw before committing.
+
+Protocol note: `MUTE_MIC` currently means "device stops sending". Barge-in
+changes it to "device keeps sending, app decides", which is a semantic change
+the Pi 5 shares. Phase 4's binary frames want a sequence and timestamp header
+anyway — design it so it can carry the alignment metadata 6c/6d need, because
+retrofitting that later is expensive.
+
+### Phase 7 — Send only the child's voice (post-demo)
+
+Goal: ignore room noise, background parents, and unrelated chatter. Four
+different technologies get conflated here and they are not interchangeable:
+
+| | Answers | Needs | Fits? |
+| --- | --- | --- | --- |
+| VAD | is *anyone* speaking? | a threshold (already present) | necessary, not sufficient |
+| Diarization | who spoke when, as anonymous clusters | seconds of audio, clustering | ✗ never says which cluster is the child |
+| Speaker verification | is this the enrolled child? | enrollment + embedding model | ✓ this is the actual ask |
+| Wake word / push-to-talk | did the user *ask* to be heard? | a button, or a small KWS model | ✓ sidesteps the problem entirely |
+
+**Run it on the laptop, not the Zero 2W.** An ECAPA-TDNN-class embedding needs
+numpy plus an ONNX runtime — neither is installed — on a 512 MB device with no
+optimised BLAS, and would spend a good share of the core Phase 2 just
+recovered. There is a subtler reason: **a gate on the device destroys the data
+needed to tune the gate.** A rejection that is never transmitted cannot be
+reviewed. Log laptop-side first, move the gate down later if the radio saving
+proves necessary.
+
+Caveats that will bite, specific to a child:
+
+- Pretrained speaker models are trained on adult corpora (VoxCeleb and
+  friends). Accuracy on child voices degrades — higher pitch, shorter vocal
+  tract, different formants.
+- A child's voiceprint **drifts as they grow**. Plan re-enrollment or slow
+  adaptation; this is not enroll-once.
+- Embeddings need ~1–3 s of *speech* to be stable, which fights realtime
+  turn-taking. Sub-second verdicts are unreliable.
+- Overlapping speech (child + parent) blends into one embedding and fails
+  unpredictably. Separation is far heavier than verification.
+- **Failure asymmetry matters more than accuracy.** A false reject means the
+  child is ignored, repeats themselves, and the product feels broken. A false
+  accept means answering the wrong person — annoying and wasteful. For a young
+  child the first is worse, so bias permissive and suppress non-targets with
+  other signals.
+
+Cheaper signals worth exhausting first:
+
+1. **Near-field level gate.** The child is close; parents are across the room.
+   §3 measured speech at +10.2 dB over ambient at the child's position. Costs
+   nothing — the RMS is already computed.
+2. **Pitch band gate.** Children sit around 250–400 Hz F0 against 85–155 Hz
+   for adult males; cheap autocorrelation rejects adult male speech for
+   almost nothing. Will not reliably separate a child from an adult female.
+3. **A second microphone — the highest-leverage option on this list.** The I2S
+   frame already carries a second channel that is *silent by design*, and the
+   ICS-43434 has an L/R select pin, so a second mic joins the same bus with no
+   extra GPIO and no protocol change. Two mics buy near-field discrimination
+   from level and phase difference, beamforming toward the child, **and a
+   spatial null that can be aimed at the speaker** — attacking Phase 6 and
+   Phase 7 with one component. Phase 2b's `route` plugin already makes channel
+   selection a config change.
+4. **Push-to-talk.** Unfashionable, but for a child's device a hold-to-talk
+   button is robust, teaches turn-taking, removes echo and speaker selection
+   entirely, and slashes radio time. [battery.md](battery.md) already lists a
+   wake button as future work.
+
+Order: level gate + logging (days) → evaluate from real logs → laptop-side
+verification only if the logs demand it → evaluate the second mic before
+buying more software. Effort: 1 day for the level gate, ~1 week for
+verification. Risk: low, then medium.
+
+Protocol note: audio you decide not to forward interacts with OpenAI's server
+VAD turn detection — the same "reconstruct the timeline faithfully or
+turn-taking breaks" caveat as Phase 5b.
+
 ## 5. Timeline
 
 | Day | Work |
 | --- | --- |
 | **Sat 25 Jul** | Phase 2a done and verified on hardware. Phase 1 **not done** — still needs the power meter. |
-| **Sun 26 Jul** (today) | Phase 2b + 2c done and verified. CPU delta measured (§3). Phase 1 still outstanding. |
+| **Sun 26 Jul** (today) | Phase 2b + 2c done and verified. CPU delta measured (§3). Echo/voice levels measured; Phases 6 and 7 written up. Phase 1 still outstanding. |
 | **Mon 27 Jul** | Phase 1 power baseline — it is now the only unmeasured thing on this list, and Phase 4's justification depends on it. Re-decide Phase 3. **Do not merge to `main`.** |
 | **Tue 28 Jul** | **Hard freeze.** Pre-demo checklist (§1). Rollback drill. Full dry run. Nothing else. |
 | **Wed 29 Jul** | Demo the baseline. |
-| **After** | Merge what's proven. Then Phase 4, Phase 5. Then port to the Pi 5. |
+| **After** | Merge what's proven. Then Phase 4, Phase 5. Then port to the Pi 5. Phases 6 and 7 are product work, not battery work — they *cost* radio time, so schedule them against Phase 1's numbers, not instead of them. |
 
 Tuesday is a freeze-and-rehearse day, not a development day. If Phase 2 is not
 finished and verified by Monday night, it waits until after the demo — the
@@ -414,8 +612,13 @@ branch keeps.
   on-device — despite the module name, `audio_gating.py` does calibration only,
   and runtime gating is entirely the app's `MUTE_MIC`/`UNMUTE_MIC`. Worth
   correcting the "echo gating" claim in [README.md:88-89](../README.md#L88-L89).
-- `config/targets.local.env` records `PIZERO2W_SAMPLE_RATE="48000"` and
-  `PIZERO2W_CAPTURE_FORMAT="S32_LE"`, but the client hardcodes 24 kHz / `S16_LE`
-  ([audio_capture.py:13-14](../audio_capture.py#L13-L14)). Those keys appear to
-  feed `scripts/audio-diagnostic.sh` rather than the client — worth confirming
-  before Phase 2, since ALSA plugin config interacts with both.
+- ~~`config/targets.local.env` records `PIZERO2W_SAMPLE_RATE="48000"` and
+  `PIZERO2W_CAPTURE_FORMAT="S32_LE"`, but the client hardcodes 24 kHz /
+  `S16_LE`~~ — **answered 2026-07-26.** Those values are the hardware's, not a
+  contradiction: `hw:0,0` supports *only* S32_LE / 48 kHz / 2ch, and `plug`
+  bridges to the client's 24 kHz / S16_LE. The consequence is in §3: the
+  truncation to 16 bits happens before any gain, and moving the gain into the
+  32-bit domain would recover about 4 bits of the mic's resolution.
+- The barge-in and voice-gating work (Phases 6 and 7) both spend SNR, and both
+  would benefit from that 32-bit change more than from anything else on this
+  list. Measure it before designing either.
