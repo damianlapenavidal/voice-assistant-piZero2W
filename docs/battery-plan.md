@@ -366,23 +366,29 @@ Fully revertible: delete `~/.asoundrc`, restart the service.
   201–276), 25 `AUDIO_FRAME`s of 4800 bytes at matching RMS.
 - 41 tests pass on the device.
 
-### Phase 3 — Mic gain → app
+### Phase 3 — Mic gain → app ~~(planned)~~ **DROPPED 2026-07-26**
 
-> **Re-decide this before starting it. Phase 2b already banked the 15.2%,**
-> in C on the device, with no protocol change and no calibration coupling.
-> What is left of Phase 3 is not a battery argument:
+> **Decided: not doing this.** Phase 2b already banked the 15.2%, in C on the
+> device, with no protocol change and no calibration coupling. What was left
+> of Phase 3 was not a battery argument:
 >
 > - *Fidelity* — the device still re-quantizes int16 after scaling, so the
->   rounding step below is real. It is also inaudible at these levels, and
->   would be better addressed by capturing S32 than by moving the gain.
-> - *Architecture* — "the app owns processing" is a defensible principle, but
->   it now costs a mandatory capability negotiation and a threshold rescale to
->   buy nothing measurable.
+>   rounding step below is real. But §3 measured where the loss actually is:
+>   `plug` truncates S32 to S16 *before* any gain, costing ~8 bits, which
+>   moving the multiply to the app does nothing about. Capturing in the 32-bit
+>   domain fixes it; Phase 3 does not.
+> - *Architecture* — "the app owns processing" is defensible, but it costs a
+>   mandatory capability negotiation and a threshold rescale to buy nothing
+>   measurable. And gain expressed in `~/.asoundrc` is arguably *more* of a
+>   thin peripheral than gain expressed in device Python.
 >
-> Against that, doing it means **undoing** working, verified device code and
-> re-introducing the coupling described below. My recommendation: drop it, and
-> put the effort into Phase 4, which the measurements say is the real prize.
-> Keeping it would need a reason that isn't CPU.
+> Against that, doing it would mean **undoing** working, verified device code
+> and re-introducing the coupling described below. The effort goes to Phase 4,
+> which the measurements say is the real prize.
+>
+> The section is kept rather than deleted so the reasoning survives — if
+> someone proposes moving capture processing to the app again, this is why it
+> was rejected, and what would have to change for the answer to differ.
 
 Recovers the ~15.2% capture cost. The device sends the raw left channel; the app
 applies the multiplier and the soft-knee limiter.
@@ -416,24 +422,61 @@ Each 100 ms chunk is 4800 bytes of PCM that goes out as ~6560 bytes after base64
 and the JSON wrapper — **~27% of radio time spent on encoding overhead**, both
 directions. Nothing else on this list is close.
 
+Measured 2026-07-26, so this one is exact: 4800 bytes of PCM → 6400 base64 →
+plus a 161-byte JSON envelope = **6561 bytes on the wire, 26.8% overhead**.
+
+> **It is a byte figure, not a battery figure.** Airtime tracks bytes for the
+> payload, but the radio stays associated and awake for the whole session, so
+> how much of session *energy* is byte-proportional is unknown until Phase 1
+> exists. Phase 4 is still the biggest lever on bytes by a wide margin; its
+> payoff at the battery is unmeasured.
+
+> **Do not sell this as a CPU win.** Measured on the device: base64 0.07% of a
+> core, `json.dumps` 0.14% — **0.25% together**, against a client that spends
+> 3.4% while streaming. The rest is websockets framing/masking, asyncio and
+> I/O. Binary frames cut masked bytes by 27%, so expect perhaps 1% of a core
+> in total. This is a radio optimisation.
+
 Keep JSON for control messages; send `AUDIO_FRAME` and `PLAY_AUDIO` as binary
 WebSocket frames with a short header (type + sequence + timestamp). The app's
 transport already has a `bytes` branch at
 `websocket_transport.py:136`, so the receive side is half-built.
 
+**Design the header for Phase 6 too.** Barge-in's better options (6c
+predicted-echo, 6d real AEC) need playback position / reference offset
+alongside the sequence number. Leaving room for it now is nearly free;
+retrofitting it means a second migration across three repos, which is exactly
+the cost that makes this phase post-demo in the first place. For the same
+reason, fold in Phase 6's `MUTE_MIC` change of meaning ("device stops sending"
+→ "device keeps sending, app decides") — same Pi 5 versus Zero migration
+problem, so it should ride the same capability flag rather than need a second.
+
 **Why this is post-demo:** BRINGUP.md explicitly freezes the message schema, and
 `docs/protocol.md` (607 lines) plus both device repos and the Pi 5 all encode
-it. This needs the same capability negotiation as Phase 3, because the Pi 5 and
-the Zero will migrate at different times.
+it. It needs capability negotiation, because the Pi 5 and the Zero will migrate
+at different times.
+
+> That negotiation used to be shared with Phase 3. **Phase 3 is dropped** (see
+> the note there), so Phase 4 is now its first and only consumer and has to
+> carry the whole cost rather than inherit it. The estimate below includes it.
 
 Effort: 2-3 days across three repos + docs. Risk: high. Payoff: highest.
 
 ### Phase 5 — Radio duty cycle (post-demo)
 
-**5a. Heartbeat interval.** Already flagged as future work in
-[battery.md:58](battery.md#L58). The app can derive `is_recording` from its own
-state and `cpu_temp` only matters during a session, so this could become
-event-driven rather than a radio wake every 10 s, forever.
+**5a. Heartbeat interval — do this before Phase 4, not after.** Already flagged
+as future work in [battery.md:58](battery.md#L58). The app can derive
+`is_recording` from its own state and `cpu_temp` only matters during a session,
+so this could become event-driven rather than a radio wake every 10 s, forever.
+
+It is an hour of work, carries no schema change, and is the only item here that
+pays off while the device is *idle* — which is most of its life. There is no
+reason it should queue behind a 2-3 day high-risk protocol migration.
+
+> One thing to preserve on the way: `DEVICE_STATUS` doubles as the app's
+> liveness signal. Make it event-driven and the app can no longer tell a dead
+> device from a quiet one. Lean on WebSocket `PING`/`PONG` at a longer interval
+> instead — the client already answers `PING` today.
 
 Effort: 1 hour. Risk: low.
 
@@ -447,6 +490,31 @@ byte count, so the win only materialises if silence markers are batched (say one
 per second), which adds up to 1 s of latency to end-of-turn detection. And the
 app must reconstruct the timeline faithfully or turn-taking breaks — the most
 demo-visible failure mode on this list.
+
+Three more, learned since:
+
+> **Phase 7 strictly dominates this, and they must share one mechanism.** Both
+> need to tell the app "there was a gap of N ms here" so it can rebuild the
+> timeline for OpenAI's VAD. Phase 7's gate elides silence *and* room noise
+> *and* other speakers — everything 5b does and more. Build the marker twice
+> and you get two incompatible ways to skip audio. Either generalise 5b's
+> silence marker into a segment marker Phase 7 reuses, or skip 5b's own
+> threshold entirely and let Phase 7's gate do the eliding.
+
+> **This re-introduces the per-sample Python loop Phase 2 just deleted.** The
+> device computes no RMS while streaming today — only during calibration.
+> Measured cost of adding one: **2.01% of a core** for a full RMS, **0.93%
+> even for `max()` alone**, because `struct.unpack` over 2400 samples dominates
+> before any arithmetic happens. `audioop` is gone (§3), so there is no C
+> shortcut. That is up to 60% of the client's entire remaining streaming CPU,
+> spent to save radio. Probably still the right trade given what this plan
+> assumes about radio-versus-CPU — but it is a trade, not a freebie, and
+> sampling every 4th sample halves it.
+
+> **Phase 6 makes this harder.** If barge-in keeps the mic open during
+> responses, the device streams *more*, and the child's audio interleaves with
+> the assistant's own speech — so the timeline the app has to reconstruct is no
+> longer a simple "silence here" gap.
 
 Effort: 1-2 days. Risk: high. Do it last, behind a flag.
 
@@ -587,10 +655,10 @@ turn-taking breaks" caveat as Phase 5b.
 | --- | --- |
 | **Sat 25 Jul** | Phase 2a done and verified on hardware. Phase 1 **not done** — still needs the power meter. |
 | **Sun 26 Jul** (today) | Phase 2b + 2c done and verified. CPU delta measured (§3). Echo/voice levels measured; Phases 6 and 7 written up. Phase 1 still outstanding. |
-| **Mon 27 Jul** | Phase 1 power baseline — it is now the only unmeasured thing on this list, and Phase 4's justification depends on it. Re-decide Phase 3. **Do not merge to `main`.** |
+| **Mon 27 Jul** | Phase 1 power baseline — it is now the only unmeasured thing on this list, and Phase 4's justification depends on it. Phase 3 is dropped, so nothing else competes for the day. **Do not merge to `main`.** |
 | **Tue 28 Jul** | **Hard freeze.** Pre-demo checklist (§1). Rollback drill. Full dry run. Nothing else. |
 | **Wed 29 Jul** | Demo the baseline. |
-| **After** | Merge what's proven. Then Phase 4, Phase 5. Then port to the Pi 5. Phases 6 and 7 are product work, not battery work — they *cost* radio time, so schedule them against Phase 1's numbers, not instead of them. |
+| **After** | Merge what's proven. Then **5a** (an hour, idle-power, no schema change), then Phase 4, then the rest of Phase 5. Then port to the Pi 5. Phases 6 and 7 are product work, not battery work — they *cost* radio time, so schedule them against Phase 1's numbers, not instead of them. |
 
 Tuesday is a freeze-and-rehearse day, not a development day. If Phase 2 is not
 finished and verified by Monday night, it waits until after the demo — the
