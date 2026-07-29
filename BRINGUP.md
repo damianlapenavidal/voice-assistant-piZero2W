@@ -36,9 +36,10 @@ volume-control tests were added). A full end-to-end demo ran the same day.
 - [ ] Phase 6 (battery baseline + trims) — **in progress**, tracked in
       [docs/battery-plan.md](docs/battery-plan.md) (merged to `main`
       2026-07-29). Power-meter readings (Phase 1 of that plan) are still
-      outstanding; DSP-offload work (Phase 2) is merged to `main` and was
-      verified on-device before the merge, but is **not yet deployed** to the
-      physical Zero.
+      outstanding; DSP-offload work (Phase 2) is merged to `main` and
+      **deployed to the physical Zero** (`~/.asoundrc` installed, `.env`
+      updated, systemd service restarted, 41/41 tests pass, loopback verified
+      through the new plugin chain) as of 2026-07-29.
 
 ## Architecture
 
@@ -165,10 +166,13 @@ phased software work. Status as of 2026-07-29:
 - Phase 1 (power-meter baseline: idle / streaming / deep-idle current) —
   **not done**, the only fully outstanding item.
 - Phase 2 (push DSP into ALSA: playback softvol, mic-gain-in-ALSA, drop the
-  dead espeak fallback) — **code merged to `main`, verified on-device before
-  the merge; not yet deployed to the physical Zero** (it still has no
-  `~/.asoundrc` and is running the pre-Phase-2 `.env`). Recovered ~22 points of
-  one CPU core (18.4% → 3.4% while streaming).
+  dead espeak fallback) — **done, merged to `main`, and deployed to the
+  physical Zero** (2026-07-29): `~/.asoundrc` installed, `.env` updated to the
+  new mixer keys, systemd service restarted, both mixer controls verified at
+  their correct indexes (231/255 mic, 100/100 playback) via the client's own
+  `SoftvolControl.apply_gain`, and a loopback recording/playback round trip
+  through `mic_in`/`softvol_out` confirmed clean. Recovered ~22 points of one
+  CPU core (18.4% → 3.4% while streaming).
 - Phase 3 (move mic gain to the app) — **dropped**; Phase 2 already banked the
   win on-device with no protocol change.
 - Phases 4–7 (binary frames, radio duty cycle, barge-in, speaker
