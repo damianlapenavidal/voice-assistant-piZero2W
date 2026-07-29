@@ -34,10 +34,11 @@ volume-control tests were added). A full end-to-end demo ran the same day.
 - [x] Phases 1–5 (wiring, I2S card, ALSA validation, client install, full
       end-to-end round trip) — done; see per-phase notes below.
 - [ ] Phase 6 (battery baseline + trims) — **in progress**, tracked in
-      [docs/battery-plan.md](docs/battery-plan.md) on branch
-      `battery/plan-barge-in` (not yet merged to `main`). Power-meter readings
-      (Phase 1 of that plan) are still outstanding; DSP-offload work (Phase 2)
-      is done and verified on-device but unmerged so `main` stays demo-clean.
+      [docs/battery-plan.md](docs/battery-plan.md) (merged to `main`
+      2026-07-29). Power-meter readings (Phase 1 of that plan) are still
+      outstanding; DSP-offload work (Phase 2) is merged to `main` and was
+      verified on-device before the merge, but is **not yet deployed** to the
+      physical Zero.
 
 ## Architecture
 
@@ -157,17 +158,17 @@ Zero — 39/39 as of 2026-07-29 (grew from 23 as gain/volume tests were added).
 ## Phase 6 — Battery baseline + trims — in progress
 
 Superseded by the more detailed [docs/battery-plan.md](docs/battery-plan.md)
-(currently on branch `battery/plan-barge-in`, not yet on `main`). Follow
-[docs/battery.md](docs/battery.md) first for the measure-before-you-trim rule,
-then `battery-plan.md` for the phased software work. Status as of 2026-07-29:
+(merged to `main` 2026-07-29, post-demo). Follow [docs/battery.md](docs/battery.md)
+first for the measure-before-you-trim rule, then `battery-plan.md` for the
+phased software work. Status as of 2026-07-29:
 
 - Phase 1 (power-meter baseline: idle / streaming / deep-idle current) —
   **not done**, the only fully outstanding item.
 - Phase 2 (push DSP into ALSA: playback softvol, mic-gain-in-ALSA, drop the
-  dead espeak fallback) — **done and verified on-device**, on
-  `battery/alsa-offload` + `battery/alsa-capture-route`, unmerged so `main`
-  stays demo-clean. Recovered ~22 points of one CPU core (18.4% → 3.4% while
-  streaming).
+  dead espeak fallback) — **code merged to `main`, verified on-device before
+  the merge; not yet deployed to the physical Zero** (it still has no
+  `~/.asoundrc` and is running the pre-Phase-2 `.env`). Recovered ~22 points of
+  one CPU core (18.4% → 3.4% while streaming).
 - Phase 3 (move mic gain to the app) — **dropped**; Phase 2 already banked the
   win on-device with no protocol change.
 - Phases 4–7 (binary frames, radio duty cycle, barge-in, speaker
