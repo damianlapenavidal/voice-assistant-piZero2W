@@ -462,6 +462,53 @@ at different times.
 
 Effort: 2-3 days across three repos + docs. Risk: high. Payoff: highest.
 
+> **Done 2026-07-29**, across `voice-assistant-piZero2W` and
+> `voice-assistant-app`. The Pi 5 port is deliberately deferred — that is the
+> whole point of the negotiation, and the Pi 5 needed *zero* changes.
+>
+> **Wire format** (full spec in `voice-assistant-app/docs/protocol.md` →
+> "Binary Audio Framing"): two distinct big-endian headers via stdlib `struct`,
+> not one shared shape — `AUDIO_FRAME` has no `is_final`/`duration_ms`, and
+> padding every 100 ms chunk with unused bytes would undercut the whole point.
+> `AUDIO_FRAME` is 18 bytes (tag, version, u32 seq, u64 capture ms, reserved
+> u32); `PLAY_AUDIO` is 15 (tag, version, u32 seq, flags byte, u32 duration
+> with `0xFFFFFFFF` = unknown, reserved u32). Measured on the real code paths:
+> **4818 and 4815 bytes** against the 6561-byte JSON baseline, i.e. 26.8%
+> overhead → ~0.4%.
+>
+> **Negotiation** rides the existing `capabilities` array: the device offers
+> `"binary_audio"` in HELLO, the app confirms it in HELLO_ACK's new
+> `negotiated_capabilities`, and each side only *sends* binary once agreed.
+> Receive-side dispatch keys off the WebSocket frame type instead, since what
+> arrives is the peer's decision and the frame type already says so
+> unambiguously. `BINARY_AUDIO_FRAMES=false` on the app forces JSON for every
+> device without touching a device or rolling back.
+>
+> **The capability negotiation Phase 4 was said to "carry the whole cost" of
+> turned out cheap** — the `capabilities` array already existed on both sides;
+> only `negotiated_capabilities` in HELLO_ACK was new. Phase 6 should add a new
+> string to the same lists rather than a second mechanism, but must not reuse
+> the literal `binary_audio` value: a device could support binary frames
+> without supporting barge-in.
+>
+> **Two things worth knowing for next time.** First, the plan said 2 app-side
+> call sites assumed base64; there were **3** — `session.py`'s
+> `_process_message` decodes audio for the dashboard's level meter,
+> independently of `bridge.py`. Second, handing raw `bytes` to the transport
+> and letting it choose the encoding meant the JSON fallback had to base64
+> explicitly: Pydantic silently decodes stray bytes into a mangled string
+> rather than erroring, which would have been **silent audio corruption on the
+> Pi 5 path only** — caught by a test asserting the JSON path still round-trips
+> real PCM, not by anything in the binary path.
+>
+> **Verification**: 57 device tests (was 45) and 281 app tests (was 267) pass,
+> plus two harnesses driving the *real* client modules against the *real* app
+> server — one proving the unmodified `pi5_client.py` negotiates nothing and
+> stays byte-identical on JSON, one proving the Zero and app agree on binary in
+> both directions while `SET_VOLUME` stays JSON on the same connection.
+> Malformed frames (short, wrong tag, wrong version, truncated) are dropped as
+> recoverable on both sides — never a torn-down session over one bad chunk.
+
 ### Phase 5 — Radio duty cycle (post-demo)
 
 **5a. Heartbeat interval — do this before Phase 4, not after.** Already flagged
