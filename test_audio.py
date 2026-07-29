@@ -1325,6 +1325,47 @@ async def _test_receive_loop_drops_malformed_binary_frame():
     print("  PASS: test_receive_loop_drops_malformed_binary_frame")
 
 
+async def _test_stop_playback_worker_survives_cancel_mid_final_chunk():
+    """Regression: STOP_AUDIO_STREAM arriving right after a final PLAY_AUDIO
+    used to crash the client. _stop_playback_worker() nils
+    self._playback_queue, then cancels the worker; if the worker was blocked
+    inside _handle_play_audio (e.g. finalize_streaming()'s subprocess wait),
+    the CancelledError landed in a `finally: self._playback_queue.task_done()`
+    that read None instead of the queue, raising AttributeError and crashing
+    the whole client. Reproduced live on hardware 2026-07-29."""
+    from zero2w_client import Zero2WClient
+
+    client = Zero2WClient("ws://test")
+    client._ensure_playback_worker()
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_finalize():
+        started.set()
+        await release.wait()
+        return 1.0
+
+    # is_streaming is read-only, derived from a live aplay subprocess; fake
+    # one so the property reads True without spawning a real process.
+    client._playback._process = MagicMock(returncode=None)
+    client._playback.finalize_streaming = slow_finalize
+
+    ws = MagicMock()
+    ws.send = AsyncMock()
+    client._playback_queue.put_nowait((ws, {
+        "audio": b"", "sequence_number": 1, "is_final": True,
+    }))
+
+    await asyncio.wait_for(started.wait(), timeout=2)
+    # The worker is now blocked inside _handle_play_audio -> finalize_streaming,
+    # exactly like a real client mid-STOP_AUDIO_STREAM. This must not raise.
+    await client._stop_playback_worker()
+
+    release.set()
+    print("  PASS: test_stop_playback_worker_survives_cancel_mid_final_chunk")
+
+
 def run_async_test(coro):
     asyncio.run(coro)
 
@@ -1375,6 +1416,7 @@ def main():
         _test_audio_stream_loop_sends_json_frame_when_not_negotiated,
         _test_receive_loop_queues_binary_play_audio,
         _test_receive_loop_drops_malformed_binary_frame,
+        _test_stop_playback_worker_survives_cancel_mid_final_chunk,
     ]
 
     total = len(sync_tests) + len(async_tests)

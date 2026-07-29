@@ -909,8 +909,15 @@ class Zero2WClient:
         problem, not this loop's -- softvol reaches audio already buffered.
         """
         assert self._playback_queue is not None
+        # Captured once: _stop_playback_worker() nils self._playback_queue
+        # before cancelling this task, so a cancellation landing mid-
+        # _handle_play_audio (e.g. inside finalize_streaming()'s subprocess
+        # wait) would otherwise hit task_done() on None instead of
+        # propagating CancelledError, crashing the client on a race that's
+        # one STOP_AUDIO_STREAM-right-after-a-final-chunk away from real.
+        queue = self._playback_queue
         while True:
-            ws, payload = await self._playback_queue.get()
+            ws, payload = await queue.get()
             try:
                 await self._handle_play_audio(ws, payload)
             except asyncio.CancelledError:
@@ -918,7 +925,7 @@ class Zero2WClient:
             except Exception as exc:  # never let one frame kill playback
                 logger.error("Playback worker error: %s", exc)
             finally:
-                self._playback_queue.task_done()
+                queue.task_done()
 
     async def _stop_playback_worker(self) -> None:
         """Cancel the playback worker and drop any un-played chunks."""
