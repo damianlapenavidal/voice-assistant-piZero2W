@@ -1,12 +1,16 @@
-"""Speaker playback via aplay subprocess (24 kHz PCM16 mono)."""
+"""Speaker playback via aplay subprocess (24 kHz PCM16 mono).
+
+Volume is *not* applied here. It is applied by ALSA, in the `softvol` plugin
+this module drives with `amixer` -- see `apply_playback_gain`.
+"""
 
 from __future__ import annotations
 
-import array
 import asyncio
 import logging
-import math
 import os
+
+from alsa_mixer import SoftvolControl, mixer_card
 
 logger = logging.getLogger(__name__)
 
@@ -16,66 +20,35 @@ BYTES_PER_SAMPLE = 2
 BYTE_RATE = SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE
 FORMAT = "S16_LE"
 BUFFER_US = 300000
-WRITE_CHUNK_BYTES = 4800  # 100 ms sub-chunks for stdin writes
-# How far ahead of real-time playback the writer is allowed to run.
-#
-# Pipe backpressure alone is far too loose to keep live volume responsive:
-# asyncio's stdin transport buffers 64 KB before drain() blocks, and the OS
-# pipe holds ~64 KB more -- ~2.7 s of audio at BYTE_RATE. A response shorter
-# than that is written, and therefore gain-scaled, in full before a single
-# sample reaches the speaker, so a mid-response SET_VOLUME could never be
-# heard. Pacing writes against a wall clock bounds that staleness instead.
-#
-# Must stay comfortably above BUFFER_US so aplay's own buffer never starves
-# (which would stutter), while small enough that the slider feels live.
-MAX_WRITE_LEAD_SEC = 0.4
 
 DEFAULT_PLAYBACK_GAIN = 1.0
-_INT16_MAX = 32767
-_INT16_MIN = -32768
-# Soft-knee limiter: below this fraction of full scale, gain is applied with
-# no shaping at all. Above it, the excess compresses asymptotically toward
-# the ceiling instead of hard-clipping. Playback volume is attenuation-only
-# (see MAX_PLAYBACK_GAIN), so this knee no longer shapes normal output; it
-# stays as a safety net against any future boost path (or a source that
-# already peaks past the knee) producing a harsh per-sample clipping spike.
-_LIMITER_KNEE_FRACTION = 0.85
 
-
-def _soft_limit(value: float) -> int:
-    """Gain-scaled sample -> int16, softly compressing anything past the knee."""
-    sign = 1.0 if value >= 0 else -1.0
-    magnitude = abs(value)
-    knee = _LIMITER_KNEE_FRACTION * _INT16_MAX
-    if magnitude <= knee:
-        limited = magnitude
-    else:
-        headroom = _INT16_MAX - knee
-        over = magnitude - knee
-        limited = knee + headroom * (1 - math.exp(-over / headroom))
-    result = sign * limited
-    if result > _INT16_MAX:
-        result = _INT16_MAX
-    elif result < _INT16_MIN:
-        result = _INT16_MIN
-    return int(result)
-
-
-def _apply_gain(pcm_bytes: bytes, gain: float) -> bytes:
-    """Scale PCM16 samples by gain, through a soft-knee limiter (see `_soft_limit`).
-
-    Peaks that would exceed the int16 ceiling compress smoothly toward it
-    instead of hard-clipping, which avoids an audible, harsh clipping
-    artifact when gain over-drives an already-loud source.
-    """
-    if gain == 1.0 or not pcm_bytes:
-        return pcm_bytes
-
-    samples = array.array("h")
-    samples.frombytes(pcm_bytes)
-    for i, value in enumerate(samples):
-        samples[i] = _soft_limit(value * gain)
-    return samples.tobytes()
+# --- ALSA volume ----------------------------------------------------------
+#
+# Volume used to be a per-sample multiply in Python. Measured on the device,
+# that cost ~10% of one core for as long as the assistant was speaking (see
+# docs/battery-plan.md) -- pure interpreter overhead, since the same
+# arithmetic in C is free. ALSA's `softvol` plugin does it in the playback
+# chain instead, leaving this module to move bytes and nothing else.
+#
+# It is also strictly more responsive. softvol sits *downstream* of aplay's
+# buffer, so a volume change affects audio already handed to aplay. The
+# Python path could only ever scale samples not yet written, which is why it
+# needed sub-chunked, wall-clock-paced writes to feel live at all; none of
+# that machinery is necessary now, and it is gone.
+#
+# The plugin, the control it creates and the range below are defined in
+# `config/asoundrc.softvol`, installed as `~/.asoundrc` on the device. These
+# constants must match that file.
+DEFAULT_MIXER_CONTROL = "PCM Playback Volume"
+DEFAULT_MIXER_PRIME_DEVICE = "softvol_prime"
+# 0 dB at the top makes playback attenuation-only in the hardware rather than
+# by convention: softvol cannot boost, so nothing can drive an already
+# normalized source past full scale. That is why the soft-knee limiter this
+# path used to need is gone.
+PLAYBACK_MIN_DB = -51.0
+PLAYBACK_MAX_DB = 0.0
+PLAYBACK_STEPS = 100  # index range 0..PLAYBACK_STEPS (`resolution 101`)
 
 
 class PlaybackError(Exception):
@@ -90,11 +63,18 @@ class PlaybackManager:
         if playback_gain is None:
             playback_gain = float(os.environ.get("PLAYBACK_GAIN", DEFAULT_PLAYBACK_GAIN))
         self._playback_gain = playback_gain
+        self._volume = SoftvolControl(
+            card=mixer_card(),
+            control=os.environ.get("AUDIO_MIXER_CONTROL", DEFAULT_MIXER_CONTROL),
+            prime_device=os.environ.get(
+                "AUDIO_MIXER_PRIME_DEVICE", DEFAULT_MIXER_PRIME_DEVICE,
+            ),
+            min_db=PLAYBACK_MIN_DB,
+            max_db=PLAYBACK_MAX_DB,
+            steps=PLAYBACK_STEPS,
+        )
         self._process: asyncio.subprocess.Process | None = None
         self._streamed_bytes = 0
-        # Wall-clock timeline for write pacing; see _write_with_live_gain.
-        self._pace_start: float | None = None
-        self._pace_written_sec = 0.0
 
     @property
     def device(self) -> str | None:
@@ -102,18 +82,30 @@ class PlaybackManager:
 
     @property
     def playback_gain(self) -> float:
-        return self._playback_gain
+        """The gain last handed to ALSA (or the .env startup value).
 
-    @playback_gain.setter
-    def playback_gain(self, value: float) -> None:
-        """Update gain live (e.g. from a SET_VOLUME command); takes effect on
-        the next chunk written -- nothing needs to restart."""
-        self._playback_gain = value
+        Kept only so the client can report the device's level to the app in
+        HELLO; the audio itself is scaled by softvol, not by this number.
+        """
+        return self._playback_gain
 
     @property
     def is_streaming(self) -> bool:
         """True while a long-lived aplay process is receiving streamed chunks."""
         return self._process is not None and self._process.returncode is None
+
+    async def apply_playback_gain(self, gain: float) -> bool:
+        """Set the ALSA volume to `gain` (linear amplitude, 0.0-1.0).
+
+        Takes effect immediately, including on audio already buffered inside
+        aplay -- nothing needs to restart and nothing waits for the current
+        response to drain.
+
+        Returns whether ALSA accepted it; see `SoftvolControl.apply_gain` for
+        why a failure is not fatal.
+        """
+        self._playback_gain = gain
+        return await self._volume.apply_gain(gain)
 
     def _build_command(self, *, quiet: bool = False) -> list[str]:
         cmd = [
@@ -135,7 +127,6 @@ class PlaybackManager:
             return
 
         self._streamed_bytes = 0
-        self._reset_pacing()
         cmd = self._build_command()
         logger.info("Starting audio playback: %s", " ".join(cmd))
 
@@ -168,10 +159,8 @@ class PlaybackManager:
         if not pcm_bytes and not is_final:
             return 0.0
 
-        # Gain is deliberately NOT applied here: it is applied per sub-chunk at
-        # write time (see `_write_with_live_gain`) so a SET_VOLUME arriving
-        # mid-response affects the part that hasn't been handed to aplay yet.
-        # Gain does not change length, so duration is safe to compute up front.
+        # These bytes reach aplay exactly as they arrived -- volume is ALSA's
+        # job now -- so the duration is simply their length.
         duration_sec = len(pcm_bytes) / BYTE_RATE
 
         if is_final:
@@ -190,43 +179,10 @@ class PlaybackManager:
             if self._process is None or self._process.stdin is None:
                 raise PlaybackError("aplay process is not running")
 
-        await self._write_with_live_gain(self._process.stdin, pcm_bytes)
+        self._process.stdin.write(pcm_bytes)
+        await self._process.stdin.drain()
         self._streamed_bytes += len(pcm_bytes)
         return duration_sec
-
-    def _reset_pacing(self) -> None:
-        """Begin a new playback timeline for write pacing."""
-        self._pace_start = None
-        self._pace_written_sec = 0.0
-
-    async def _write_with_live_gain(self, stdin, pcm_bytes: bytes) -> None:
-        """Feed PCM to aplay in sub-chunks, re-reading gain before each one.
-
-        Two things together make the volume slider audible mid-response:
-        re-reading `self._playback_gain` per sub-chunk rather than scaling the
-        whole buffer up front, and pacing the writes so only a bounded amount
-        of already-scaled audio is ever committed downstream (see
-        MAX_WRITE_LEAD_SEC -- pipe backpressure alone is ~2.7 s too loose).
-
-        The timeline spans calls, so streamed chunks arriving faster than
-        real time are paced as one continuous response rather than each call
-        getting a fresh lead allowance.
-        """
-        loop = asyncio.get_running_loop()
-        if self._pace_start is None:
-            self._pace_start = loop.time()
-
-        for offset in range(0, len(pcm_bytes), WRITE_CHUNK_BYTES):
-            part = pcm_bytes[offset:offset + WRITE_CHUNK_BYTES]
-            stdin.write(_apply_gain(part, self._playback_gain))
-            await stdin.drain()
-            self._pace_written_sec += len(part) / BYTE_RATE
-
-            # Sleep off anything queued beyond the allowed lead, so the next
-            # sub-chunk is scaled with whatever gain is current by then.
-            lead = self._pace_written_sec - (loop.time() - self._pace_start)
-            if lead > MAX_WRITE_LEAD_SEC:
-                await asyncio.sleep(lead - MAX_WRITE_LEAD_SEC)
 
     async def finalize_streaming(self) -> float:
         """Close streaming stdin and wait for aplay to finish.
@@ -240,7 +196,6 @@ class PlaybackManager:
         duration_sec = self._streamed_bytes / BYTE_RATE
         self._process = None
         self._streamed_bytes = 0
-        self._reset_pacing()
 
         stderr_data = b""
         try:
@@ -284,7 +239,8 @@ class PlaybackManager:
         stderr_data = b""
         try:
             if pcm_bytes and process.stdin is not None:
-                await self._write_with_live_gain(process.stdin, pcm_bytes)
+                process.stdin.write(pcm_bytes)
+                await process.stdin.drain()
 
             if process.stdin is not None and not process.stdin.is_closing():
                 process.stdin.close()
@@ -309,7 +265,6 @@ class PlaybackManager:
         process = self._process
         self._process = None
         self._streamed_bytes = 0
-        self._reset_pacing()
 
         if process is None:
             return
