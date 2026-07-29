@@ -1048,6 +1048,106 @@ async def _test_handshake_keeps_own_levels_when_app_sends_none():
     print("  PASS: test_handshake_keeps_own_levels_when_app_sends_none")
 
 
+async def _test_status_loop_silent_while_idle():
+    """No DEVICE_STATUS at all while idle -- Phase 5a drops the every-10s
+    radio wake for its own sake, since idle is most of the device's life."""
+    from zero2w_client import Zero2WClient
+
+    client = Zero2WClient("ws://test")
+    ws = _FakeWebSocket([])
+
+    task = asyncio.create_task(client._status_loop(ws))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert ws.sent == []
+    print("  PASS: test_status_loop_silent_while_idle")
+
+
+async def _test_status_loop_sends_immediately_on_recording_transitions():
+    """A recording-state change wakes the loop immediately, so the app learns
+    is_recording changed within one tick rather than up to
+    STATUS_INTERVAL_SECONDS late."""
+    from zero2w_client import Zero2WClient
+
+    client = Zero2WClient("ws://test")
+    ws = _FakeWebSocket([])
+
+    with patch("zero2w_client.STATUS_INTERVAL_SECONDS", 999):
+        task = asyncio.create_task(client._status_loop(ws))
+        await asyncio.sleep(0.01)
+        assert ws.sent == []  # still idle, no timer-driven send
+
+        client.is_recording = True
+        client._status_event.set()
+        await asyncio.sleep(0.01)
+        assert len(ws.sent) == 1
+        assert json.loads(ws.sent[0])["payload"]["is_recording"] is True
+
+        client.is_recording = False
+        client._status_event.set()
+        await asyncio.sleep(0.01)
+        assert len(ws.sent) == 2
+        assert json.loads(ws.sent[1])["payload"]["is_recording"] is False
+
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    print("  PASS: test_status_loop_sends_immediately_on_recording_transitions")
+
+
+async def _test_status_loop_sends_periodically_while_recording():
+    """cpu_temp only matters mid-session, so recording keeps the old
+    STATUS_INTERVAL_SECONDS cadence even with no new state-change events."""
+    from zero2w_client import Zero2WClient
+
+    client = Zero2WClient("ws://test")
+    ws = _FakeWebSocket([])
+    client.is_recording = True
+
+    with patch("zero2w_client.STATUS_INTERVAL_SECONDS", 0.02):
+        task = asyncio.create_task(client._status_loop(ws))
+        await asyncio.sleep(0.07)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    # ~0.07s at a 0.02s interval -> at least 3 sends, none event-triggered.
+    assert len(ws.sent) >= 3
+    assert all(json.loads(m)["payload"]["is_recording"] is True for m in ws.sent)
+    print("  PASS: test_status_loop_sends_periodically_while_recording")
+
+
+async def _test_start_and_stop_audio_trigger_status_event():
+    """_start_audio/_stop_audio actually set _status_event -- the wiring
+    _status_loop depends on to notice a recording transition at all."""
+    from zero2w_client import Zero2WClient
+
+    client = Zero2WClient("ws://test")
+    ws = MagicMock()
+    ws.send = AsyncMock()
+    client._audio_capture.start = AsyncMock()
+
+    assert not client._status_event.is_set()
+    await client._start_audio(ws, {"skip_calibration": True})
+    assert client._status_event.is_set()
+
+    client._status_event.clear()
+    await client._stop_audio()
+    assert client._status_event.is_set()
+
+    print("  PASS: test_start_and_stop_audio_trigger_status_event")
+
+
 def run_async_test(coro):
     asyncio.run(coro)
 
@@ -1088,6 +1188,10 @@ def main():
         _test_drain_buffered_audio_discards_backlog,
         _test_drain_buffered_audio_noop_when_idle,
         _test_drain_continuously_keeps_pipe_empty,
+        _test_status_loop_silent_while_idle,
+        _test_status_loop_sends_immediately_on_recording_transitions,
+        _test_status_loop_sends_periodically_while_recording,
+        _test_start_and_stop_audio_trigger_status_event,
     ]
 
     total = len(sync_tests) + len(async_tests)

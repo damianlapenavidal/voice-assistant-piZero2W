@@ -480,6 +480,27 @@ reason it should queue behind a 2-3 day high-risk protocol migration.
 
 Effort: 1 hour. Risk: low.
 
+> **Done 2026-07-29.** Checked the liveness caveat above against the app
+> repo first: `voice-assistant-app` never actually sends an app-level `PING`
+> today (the client's `PING`→`PONG` handler was, and remains, unused), and
+> nothing in `session.py` times out on a missing `DEVICE_STATUS` — the
+> dashboard just displays whatever `device_status` payload arrived most
+> recently. The app's real liveness signal is the WebSocket connection object
+> itself, kept alive by `websockets`' own low-level ping/pong (its default
+> `ping_interval`/`ping_timeout`, unconfigured on either side, so both default
+> to 20s). So event-driving `DEVICE_STATUS` needed **no app-side change** —
+> the risk the caveat named doesn't apply to this codebase as it stands today.
+>
+> Implementation, device-only: `Zero2WClient` gained a `_status_event`
+> (`asyncio.Event`), set on every `is_recording` transition in `_start_audio`/
+> `_stop_audio`. `_status_loop` now blocks on that event indefinitely while
+> idle (zero sends, zero radio wakes) and with a `STATUS_INTERVAL_SECONDS`
+> timeout while recording (unchanged 10s cadence, since `cpu_temp` only
+> matters mid-session) — either way sending the instant it wakes. 4 new tests
+> in `test_audio.py` cover: silence while idle, immediate sends on both
+> recording transitions, periodic sends while recording, and that
+> `_start_audio`/`_stop_audio` actually set the event. 45/45 tests pass.
+
 **5b. Elide silence.** The device streams continuous PCM including silence
 because OpenAI's server VAD needs it
 ([zero2w_client.py:643-651](../zero2w_client.py#L643-L651)) — but the *app* can

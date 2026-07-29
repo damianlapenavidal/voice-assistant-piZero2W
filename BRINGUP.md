@@ -175,7 +175,12 @@ phased software work. Status as of 2026-07-29:
   CPU core (18.4% → 3.4% while streaming).
 - Phase 3 (move mic gain to the app) — **dropped**; Phase 2 already banked the
   win on-device with no protocol change.
-- Phases 4–7 (binary frames, radio duty cycle, barge-in, speaker
+- Phase 5a (event-driven `DEVICE_STATUS`) — **done and deployed**, 2026-07-29:
+  no sends at all while idle, immediate send on every recording-state change,
+  10s cadence preserved only while actually recording. Device-only change; no
+  app-side liveness fix was needed (the app already relies on the WebSocket
+  connection itself, not `DEVICE_STATUS` cadence). 45/45 tests pass.
+- Phase 4, 5b, 6, 7 (binary frames, silence eliding, barge-in, speaker
   verification) — designed, not started; see `battery-plan.md` §4.
 
 **Checkpoint:** recorded idle + streaming current numbers; OS trims applied

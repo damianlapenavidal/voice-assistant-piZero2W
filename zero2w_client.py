@@ -13,7 +13,8 @@ The client performs the following:
   1. Connects to the app's WebSocket server
   2. Sends HELLO with device info
   3. Waits for HELLO_ACK (session config)
-  4. Enters a main loop: sends periodic DEVICE_STATUS, handles commands
+  4. Enters a main loop: sends DEVICE_STATUS on recording-state changes (and
+     periodically while recording), handles commands
   5. Reconnects with exponential backoff on disconnection
 """
 
@@ -306,6 +307,7 @@ class Zero2WClient:
         self.server_url = server_url
         self.session_id: str | None = None
         self.is_recording = False
+        self._status_event = asyncio.Event()
         self._running = False
         self._ws = None
         self._audio_capture = AudioCapture()
@@ -392,7 +394,10 @@ class Zero2WClient:
 
         # --- Main loop ---
         self._running = True
-        logger.info("Entering main loop. Sending status every %ds.", STATUS_INTERVAL_SECONDS)
+        logger.info(
+            "Entering main loop. DEVICE_STATUS on recording changes, every %ds while recording.",
+            STATUS_INTERVAL_SECONDS,
+        )
 
         status_task = asyncio.create_task(self._status_loop(ws))
         try:
@@ -490,9 +495,29 @@ class Zero2WClient:
         )
 
     async def _status_loop(self, ws) -> None:
-        """Send DEVICE_STATUS messages at a regular interval."""
+        """Send DEVICE_STATUS on recording-state changes, and every
+        STATUS_INTERVAL_SECONDS while actually recording.
+
+        Idle is most of the device's life, and cpu_temp only matters mid-
+        session, so idle waits here indefinitely instead of waking the radio
+        every 10 s forever. `_start_audio`/`_stop_audio` set `_status_event`
+        on every is_recording transition, which both wakes an idle wait
+        immediately and interrupts a recording-side timeout early -- either
+        way this sends a fresh status right when there's something new to
+        report, rather than up to STATUS_INTERVAL_SECONDS stale.
+        """
         while True:
-            await asyncio.sleep(STATUS_INTERVAL_SECONDS)
+            if self.is_recording:
+                try:
+                    await asyncio.wait_for(
+                        self._status_event.wait(), timeout=STATUS_INTERVAL_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                await self._status_event.wait()
+            self._status_event.clear()
+
             status = make_device_status(self.is_recording)
             try:
                 await ws.send(status)
@@ -587,6 +612,7 @@ class Zero2WClient:
             return
 
         self.is_recording = True
+        self._status_event.set()
         self._sequence_number = 0
         self._calibration_retries = 0
         self._mic_muted = False
@@ -607,6 +633,7 @@ class Zero2WClient:
     async def _stop_audio(self) -> None:
         """Stop capture task and terminate arecord."""
         self.is_recording = False
+        self._status_event.set()
 
         await self._stop_playback_worker()
 

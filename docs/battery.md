@@ -53,9 +53,13 @@ happens:
 - On `STOP_AUDIO_STREAM` the capture/playback subprocesses are **fully stopped**.
 - The WebSocket stays connected for low-latency sessions.
 
+**`DEVICE_STATUS` is now event-driven** (Phase 5a, [battery-plan.md](battery-plan.md#phase-5-radio-duty-cycle-post-demo), done 2026-07-29): it fires
+immediately on every recording-state change and otherwise only every 10s
+*while actually recording* — idle sends nothing at all, rather than waking the
+radio every 10s forever.
+
 Future (app-coordinated, only after basic bring-up works):
 
-- Longer `DEVICE_STATUS` heartbeat interval when not recording.
 - Disconnect-until-wake (button) instead of holding the socket.
 - Drive amp **SD_MODE** from a GPIO so the amp sleeps when idle. **Avoid**
   Adafruit's continuous silent `aplay /dev/zero` click-fix service on battery —
