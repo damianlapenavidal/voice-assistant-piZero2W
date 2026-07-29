@@ -6,20 +6,29 @@ Run with: python test_client.py
 No external dependencies required beyond the standard library.
 """
 
+import base64
 import json
+import struct
 import sys
+from datetime import datetime
 from pathlib import Path
 
 # Add device/ to path so we can import zero2w_client
 sys.path.insert(0, str(Path(__file__).parent))
 
 from zero2w_client import (
-    make_hello,
-    make_device_status,
-    make_pong,
-    make_message,
-    parse_message,
+    AUDIO_FRAME_TAG,
+    HEADER_VERSION,
+    PLAY_AUDIO_TAG,
+    as_pcm_bytes,
+    decode_play_audio_binary,
     get_device_id,
+    make_audio_frame,
+    make_device_status,
+    make_hello,
+    make_message,
+    make_pong,
+    parse_message,
 )
 
 
@@ -38,6 +47,7 @@ def test_hello_message():
     assert payload["firmware_version"] == "0.1.0"
     assert "audio_capture" in payload["capabilities"]
     assert "audio_playback" in payload["capabilities"]
+    assert "binary_audio" in payload["capabilities"]
 
     print("  PASS: test_hello_message")
 
@@ -176,6 +186,98 @@ def test_command_parsing():
     print("  PASS: test_command_parsing")
 
 
+def test_make_audio_frame_json_default():
+    """make_audio_frame without binary=True is unchanged: base64-in-JSON."""
+    raw = make_audio_frame(b"\x01\x02\x03\x04", 7, "2026-07-29T12:00:00+00:00")
+    assert isinstance(raw, str)
+    msg = json.loads(raw)
+
+    assert msg["type"] == "AUDIO_FRAME"
+    assert msg["payload"]["sequence_number"] == 7
+    assert msg["payload"]["timestamp"] == "2026-07-29T12:00:00+00:00"
+    assert base64.b64decode(msg["payload"]["audio"]) == b"\x01\x02\x03\x04"
+
+    print("  PASS: test_make_audio_frame_json_default")
+
+
+def test_make_audio_frame_binary_round_trip():
+    """binary=True packs the exact header layout docs/protocol.md defines."""
+    pcm = b"\xAA\xBB\xCC\xDD\xEE"
+    ts = "2026-07-29T12:00:00+00:00"
+    frame = make_audio_frame(pcm, 12345, ts, binary=True)
+
+    assert isinstance(frame, bytes)
+    header = struct.Struct(">BBIQI")
+    tag, version, seq, capture_ms, reserved = header.unpack_from(frame, 0)
+
+    assert tag == AUDIO_FRAME_TAG
+    assert version == HEADER_VERSION
+    assert seq == 12345
+    assert reserved == 0
+    expected_ms = int(datetime.fromisoformat(ts).timestamp() * 1000)
+    assert capture_ms == expected_ms
+    assert frame[header.size:] == pcm
+
+    print("  PASS: test_make_audio_frame_binary_round_trip")
+
+
+def test_decode_play_audio_binary_valid():
+    """A well-formed binary PLAY_AUDIO frame decodes to the JSON-equivalent
+    payload shape _handle_play_audio already expects."""
+    pcm = b"\x01\x02\x03"
+    header = struct.pack(">BBIBII", PLAY_AUDIO_TAG, HEADER_VERSION, 42, 0x01, 250, 0)
+    msg = decode_play_audio_binary(header + pcm)
+
+    assert msg["type"] == "PLAY_AUDIO"
+    payload = msg["payload"]
+    assert payload["audio"] == pcm
+    assert payload["sequence_number"] == 42
+    assert payload["is_final"] is True
+    assert payload["duration_ms"] == 250
+
+    print("  PASS: test_decode_play_audio_binary_valid")
+
+
+def test_decode_play_audio_binary_duration_unknown_sentinel():
+    """0xFFFFFFFF duration means 'unknown', preserving int | None."""
+    header = struct.pack(">BBIBII", PLAY_AUDIO_TAG, HEADER_VERSION, 1, 0x00, 0xFFFFFFFF, 0)
+    msg = decode_play_audio_binary(header)
+
+    assert msg["payload"]["duration_ms"] is None
+    assert msg["payload"]["is_final"] is False
+    assert msg["payload"]["audio"] == b""
+
+    print("  PASS: test_decode_play_audio_binary_duration_unknown_sentinel")
+
+
+def test_decode_play_audio_binary_malformed_frames_are_dropped():
+    """Each malformed case returns None (logged) rather than raising -- a
+    bad frame must never crash the session."""
+    valid_header = struct.pack(">BBIBII", PLAY_AUDIO_TAG, HEADER_VERSION, 1, 0, 0, 0)
+
+    too_short = b"\x02"
+    wrong_tag = struct.pack(">BBIBII", 0x99, HEADER_VERSION, 1, 0, 0, 0)
+    wrong_version = struct.pack(">BBIBII", PLAY_AUDIO_TAG, 99, 1, 0, 0, 0)
+    truncated = valid_header[:5]
+
+    for case in (too_short, wrong_tag, wrong_version, truncated):
+        assert decode_play_audio_binary(case) is None
+
+    print("  PASS: test_decode_play_audio_binary_malformed_frames_are_dropped")
+
+
+def test_as_pcm_bytes_handles_both_representations():
+    """as_pcm_bytes normalizes base64 str (JSON form), raw bytes (binary
+    form), and None identically."""
+    pcm = b"\x01\x02\x03\x04"
+    assert as_pcm_bytes(base64.b64encode(pcm).decode("ascii")) == pcm
+    assert as_pcm_bytes(pcm) == pcm
+    assert as_pcm_bytes(bytearray(pcm)) == pcm
+    assert as_pcm_bytes(None) == b""
+
+    print("  PASS: test_as_pcm_bytes_handles_both_representations")
+
+
 def main():
     tests = [
         test_hello_message,
@@ -187,6 +289,12 @@ def main():
         test_message_format_matches_protocol,
         test_hello_ack_parsing,
         test_command_parsing,
+        test_make_audio_frame_json_default,
+        test_make_audio_frame_binary_round_trip,
+        test_decode_play_audio_binary_valid,
+        test_decode_play_audio_binary_duration_unknown_sentinel,
+        test_decode_play_audio_binary_malformed_frames_are_dropped,
+        test_as_pcm_bytes_handles_both_representations,
     ]
 
     print(f"Running {len(tests)} tests...\n")

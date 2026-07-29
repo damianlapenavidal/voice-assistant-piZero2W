@@ -27,6 +27,7 @@ import math
 import os
 import platform
 import socket
+import struct
 import sys
 import time
 from datetime import datetime, timezone
@@ -62,8 +63,21 @@ except ImportError:
 
 DEVICE_TYPE = "pi_zero_2w"
 FIRMWARE_VERSION = "0.1.0"
-CAPABILITIES = ["audio_capture", "audio_playback"]
+CAPABILITIES = ["audio_capture", "audio_playback", "binary_audio"]
 STATUS_INTERVAL_SECONDS = 10
+
+# Binary AUDIO_FRAME/PLAY_AUDIO framing (Phase 4 of docs/battery-plan.md),
+# used only once "binary_audio" is negotiated in HELLO_ACK -- see
+# docs/protocol.md's "Binary Audio Framing" section for the wire format.
+# Both reserved fields are earmarked for Phase 6 (barge-in echo alignment);
+# they must stay 0 until that phase assigns them meaning.
+AUDIO_FRAME_TAG = 0x01
+PLAY_AUDIO_TAG = 0x02
+HEADER_VERSION = 1
+_AUDIO_FRAME_STRUCT = struct.Struct(">BBIQI")  # tag, version, seq, ts_ms, reserved
+_PLAY_AUDIO_STRUCT = struct.Struct(">BBIBII")  # tag, version, seq, flags, duration_ms, reserved
+_FLAG_IS_FINAL = 0x01
+_DURATION_UNKNOWN = 0xFFFFFFFF
 # Reconnecting to the app uses exponential backoff, capped at this many seconds.
 MAX_BACKOFF_SECONDS = 30.0
 MAX_CALIBRATION_RETRIES = 5
@@ -258,14 +272,69 @@ def make_audio_frame(
     pcm_bytes: bytes,
     sequence_number: int,
     capture_timestamp: str | None = None,
-) -> str:
-    """Create an AUDIO_FRAME message with base64-encoded PCM16 audio."""
+    *,
+    binary: bool = False,
+) -> str | bytes:
+    """Create an AUDIO_FRAME message.
+
+    JSON form (default): base64-encoded PCM16 audio, as always. Binary form
+    (only once "binary_audio" is negotiated) is a short header + raw PCM --
+    base64+JSON was measured at 26.8% wire overhead; the header is ~0.4%.
+    """
     capture_ts = capture_timestamp or utc_now_iso()
+    if binary:
+        capture_ms = int(datetime.fromisoformat(capture_ts).timestamp() * 1000)
+        header = _AUDIO_FRAME_STRUCT.pack(
+            AUDIO_FRAME_TAG, HEADER_VERSION, sequence_number & 0xFFFFFFFF, capture_ms, 0,
+        )
+        return header + pcm_bytes
     return make_message("AUDIO_FRAME", {
         "audio": base64.b64encode(pcm_bytes).decode("ascii"),
         "sequence_number": sequence_number,
         "timestamp": capture_ts,
     })
+
+
+def decode_play_audio_binary(raw: bytes) -> dict | None:
+    """Parse a binary PLAY_AUDIO frame into the same payload shape a JSON
+    PLAY_AUDIO message would produce.
+
+    Returns None (logged) on any malformed frame -- this is live audio a
+    child is listening to, so a bad frame is dropped, not a crashed session.
+    """
+    try:
+        if len(raw) < 2:
+            raise ValueError("frame shorter than 2-byte tag+version prefix")
+        tag, version = raw[0], raw[1]
+        if tag != PLAY_AUDIO_TAG:
+            raise ValueError(f"unexpected binary frame tag {tag:#04x}")
+        if version != HEADER_VERSION:
+            raise ValueError(f"unsupported PLAY_AUDIO header version {version}")
+        if len(raw) < _PLAY_AUDIO_STRUCT.size:
+            raise ValueError("truncated PLAY_AUDIO header")
+        _, _, seq, flags, duration, _ = _PLAY_AUDIO_STRUCT.unpack_from(raw, 0)
+        return {
+            "type": "PLAY_AUDIO",
+            "payload": {
+                "audio": raw[_PLAY_AUDIO_STRUCT.size:],
+                "sequence_number": seq,
+                "is_final": bool(flags & _FLAG_IS_FINAL),
+                "duration_ms": None if duration == _DURATION_UNKNOWN else duration,
+            },
+        }
+    except (struct.error, ValueError, IndexError) as exc:
+        logger.warning("Malformed binary PLAY_AUDIO frame (%s), dropping", exc)
+        return None
+
+
+def as_pcm_bytes(audio: bytes | bytearray | str | None) -> bytes:
+    """Normalize a PLAY_AUDIO payload's `audio` field to raw PCM bytes,
+    whether it arrived as base64 (JSON form) or already raw (binary form)."""
+    if audio is None:
+        return b""
+    if isinstance(audio, (bytes, bytearray)):
+        return bytes(audio)
+    return base64.b64decode(audio)
 
 
 def make_error(code: str, message: str, recoverable: bool) -> str:
@@ -308,6 +377,7 @@ class Zero2WClient:
         self.session_id: str | None = None
         self.is_recording = False
         self._status_event = asyncio.Event()
+        self._binary_audio_enabled = False
         self._running = False
         self._ws = None
         self._audio_capture = AudioCapture()
@@ -438,6 +508,10 @@ class Zero2WClient:
             "Handshake complete! session_id=%s, audio_config=%s",
             self.session_id, audio_config,
         )
+        negotiated = payload.get("negotiated_capabilities", [])
+        self._binary_audio_enabled = "binary_audio" in negotiated
+        if self._binary_audio_enabled:
+            logger.info("Binary audio frames negotiated with the app")
         await self._adopt_initial_levels(payload, audio_config)
 
     async def _adopt_initial_levels(self, payload: dict, audio_config: dict) -> None:
@@ -528,7 +602,15 @@ class Zero2WClient:
     async def _receive_loop(self, ws) -> None:
         """Listen for messages from the app and handle commands."""
         async for raw in ws:
-            msg = parse_message(raw)
+            if isinstance(raw, (bytes, bytearray)):
+                # The only binary frames the app ever sends are PLAY_AUDIO,
+                # once negotiated (see docs/protocol.md's "Binary Audio
+                # Framing" section) -- a malformed one is dropped, not fatal.
+                msg = decode_play_audio_binary(raw)
+                if msg is None:
+                    continue
+            else:
+                msg = parse_message(raw)
             msg_type = msg.get("type")
             payload = msg.get("payload", {})
 
@@ -701,7 +783,10 @@ class Zero2WClient:
                 # quiet periods after speech to detect end-of-turn.
                 self._sequence_number += 1
                 capture_ts = utc_now_iso()
-                frame = make_audio_frame(chunk, self._sequence_number, capture_ts)
+                frame = make_audio_frame(
+                    chunk, self._sequence_number, capture_ts,
+                    binary=self._binary_audio_enabled,
+                )
                 await ws.send(frame)
                 logger.debug("Sent AUDIO_FRAME #%d (%d bytes)", self._sequence_number, len(chunk))
         except ConnectionClosed:
@@ -850,11 +935,10 @@ class Zero2WClient:
     async def _handle_play_audio(self, ws, payload: dict) -> None:
         """Decode PLAY_AUDIO payload and pipe PCM to aplay."""
         seq = payload.get("sequence_number")
-        audio_b64 = payload.get("audio", "")
         is_final = payload.get("is_final", False)
 
         try:
-            pcm_bytes = base64.b64decode(audio_b64)
+            pcm_bytes = as_pcm_bytes(payload.get("audio"))
 
             if is_final and self._playback.is_streaming:
                 if pcm_bytes:

@@ -591,6 +591,25 @@ class _FakeWebSocket:
         self.sent.append(msg)
 
 
+def _one_chunk_then_block(chunk: bytes):
+    """A read_chunk stand-in that yields one chunk, then blocks forever.
+
+    A real capture blocks until arecord has audio, which paces the stream
+    loop at real time. A mock that returns instantly instead spins the loop
+    as fast as the event loop allows -- millions of iterations and unbounded
+    memory in the time it takes to cancel it. Blocking after the first chunk
+    keeps the send count deterministic and the test honest about pacing.
+    """
+    async def read_chunk():
+        if not sent_one:
+            sent_one.append(True)
+            return chunk
+        await asyncio.Event().wait()
+
+    sent_one: list = []
+    return read_chunk
+
+
 async def _test_set_volume_updates_playback_gain():
     """SET_VOLUME (0-100) maps onto [0, MAX_PLAYBACK_GAIN] with a square-law
     taper, so the audible change is spread across the slider rather than
@@ -1148,6 +1167,164 @@ async def _test_start_and_stop_audio_trigger_status_event():
     print("  PASS: test_start_and_stop_audio_trigger_status_event")
 
 
+async def _test_handshake_negotiates_binary_audio():
+    """HELLO_ACK carrying negotiated_capabilities: [binary_audio] flips the
+    client's send path to binary for subsequent AUDIO_FRAMEs."""
+    from zero2w_client import Zero2WClient
+
+    client = Zero2WClient("ws://test")
+    ws = _FakeWebSocket([json.dumps({
+        "type": "HELLO_ACK",
+        "payload": {
+            "session_id": "s",
+            "audio_config": {"sample_rate": 24000},
+            "negotiated_capabilities": ["binary_audio"],
+        },
+    })])
+
+    alsa = _FakeAlsaTool()
+    with _patch_alsa(alsa):
+        await client._handshake(ws)
+
+    assert client._binary_audio_enabled is True
+    print("  PASS: test_handshake_negotiates_binary_audio")
+
+
+async def _test_handshake_without_negotiation_stays_json():
+    """No negotiated_capabilities (today's app, or a Pi-5-shaped negotiation)
+    leaves the client on JSON framing."""
+    from zero2w_client import Zero2WClient
+
+    client = Zero2WClient("ws://test")
+    ws = _FakeWebSocket([json.dumps({
+        "type": "HELLO_ACK",
+        "payload": {"session_id": "s", "audio_config": {"sample_rate": 24000}},
+    })])
+
+    alsa = _FakeAlsaTool()
+    with _patch_alsa(alsa):
+        await client._handshake(ws)
+
+    assert client._binary_audio_enabled is False
+    print("  PASS: test_handshake_without_negotiation_stays_json")
+
+
+async def _test_audio_stream_loop_sends_binary_frame_when_negotiated():
+    """Once binary_audio is negotiated, AUDIO_FRAME goes out as a packed
+    header + raw PCM instead of base64-in-JSON."""
+    from zero2w_client import AUDIO_FRAME_TAG, HEADER_VERSION, Zero2WClient
+
+    client = Zero2WClient("ws://test")
+    client._binary_audio_enabled = True
+    client.is_recording = True
+    client._stream_to_laptop = True
+
+    chunk = b"\x11\x22\x33\x44" * 100
+    client._audio_capture.read_chunk = _one_chunk_then_block(chunk)
+
+    sent: list = []
+    ws = MagicMock()
+    ws.send = AsyncMock(side_effect=lambda m: sent.append(m))
+
+    task = asyncio.create_task(client._audio_stream_loop(ws))
+    await asyncio.sleep(0.02)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert len(sent) == 1
+    frame = sent[0]
+    assert isinstance(frame, bytes)
+    header = struct.Struct(">BBIQI")
+    tag, version, seq, _capture_ms, reserved = header.unpack_from(frame, 0)
+    assert tag == AUDIO_FRAME_TAG
+    assert version == HEADER_VERSION
+    assert seq == 1
+    assert reserved == 0
+    assert frame[header.size:] == chunk
+
+    print("  PASS: test_audio_stream_loop_sends_binary_frame_when_negotiated")
+
+
+async def _test_audio_stream_loop_sends_json_frame_when_not_negotiated():
+    """Default (not negotiated) behavior is unchanged: base64-in-JSON."""
+    from zero2w_client import Zero2WClient
+
+    client = Zero2WClient("ws://test")
+    client.is_recording = True
+    client._stream_to_laptop = True
+
+    chunk = b"\xAA\xBB"
+    client._audio_capture.read_chunk = _one_chunk_then_block(chunk)
+
+    sent: list = []
+    ws = MagicMock()
+    ws.send = AsyncMock(side_effect=lambda m: sent.append(m))
+
+    task = asyncio.create_task(client._audio_stream_loop(ws))
+    await asyncio.sleep(0.02)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert len(sent) == 1
+    assert isinstance(sent[0], str)
+    msg = json.loads(sent[0])
+    assert msg["type"] == "AUDIO_FRAME"
+    assert base64.b64decode(msg["payload"]["audio"]) == chunk
+
+    print("  PASS: test_audio_stream_loop_sends_json_frame_when_not_negotiated")
+
+
+async def _test_receive_loop_queues_binary_play_audio():
+    """A binary PLAY_AUDIO frame through _receive_loop decodes correctly and
+    reaches the playback queue, same shape as the JSON path.
+
+    Pre-creates the queue and stubs out _ensure_playback_worker so nothing
+    concurrently drains it -- this test is about the decode+dispatch, not the
+    worker (covered elsewhere).
+    """
+    from zero2w_client import HEADER_VERSION, PLAY_AUDIO_TAG, Zero2WClient
+
+    client = Zero2WClient("ws://test")
+    client._playback_queue = asyncio.Queue()
+    client._ensure_playback_worker = lambda: None
+
+    pcm = b"\x01\x02\x03\x04"
+    header = struct.pack(">BBIBII", PLAY_AUDIO_TAG, HEADER_VERSION, 5, 0x01, 100, 0)
+    ws = _FakeWebSocket([header + pcm])
+
+    await client._receive_loop(ws)
+
+    _, payload = client._playback_queue.get_nowait()
+    assert payload["audio"] == pcm
+    assert payload["sequence_number"] == 5
+    assert payload["is_final"] is True
+    assert payload["duration_ms"] == 100
+
+    print("  PASS: test_receive_loop_queues_binary_play_audio")
+
+
+async def _test_receive_loop_drops_malformed_binary_frame():
+    """A malformed binary frame is dropped silently -- no crash, and it never
+    even reaches the playback worker."""
+    from zero2w_client import Zero2WClient
+
+    client = Zero2WClient("ws://test")
+    called = {"value": False}
+    client._ensure_playback_worker = lambda: called.__setitem__("value", True)
+
+    ws = _FakeWebSocket([b"\x02"])  # too short to be a valid header
+    await client._receive_loop(ws)  # must not raise
+
+    assert called["value"] is False
+    print("  PASS: test_receive_loop_drops_malformed_binary_frame")
+
+
 def run_async_test(coro):
     asyncio.run(coro)
 
@@ -1192,6 +1369,12 @@ def main():
         _test_status_loop_sends_immediately_on_recording_transitions,
         _test_status_loop_sends_periodically_while_recording,
         _test_start_and_stop_audio_trigger_status_event,
+        _test_handshake_negotiates_binary_audio,
+        _test_handshake_without_negotiation_stays_json,
+        _test_audio_stream_loop_sends_binary_frame_when_negotiated,
+        _test_audio_stream_loop_sends_json_frame_when_not_negotiated,
+        _test_receive_loop_queues_binary_play_audio,
+        _test_receive_loop_drops_malformed_binary_frame,
     ]
 
     total = len(sync_tests) + len(async_tests)
