@@ -190,8 +190,21 @@ phased software work. Status as of 2026-07-29:
   10s cadence preserved only while actually recording. Device-only change; no
   app-side liveness fix was needed (the app already relies on the WebSocket
   connection itself, not `DEVICE_STATUS` cadence). 45/45 tests pass.
-- Phase 4, 5b, 6, 7 (binary frames, silence eliding, barge-in, speaker
-  verification) — designed, not started; see `battery-plan.md` §4.
+- Phase 4 (binary audio framing) — **done and deployed**, 2026-07-29:
+  `AUDIO_FRAME`/`PLAY_AUDIO` go over the wire as a packed header + raw PCM once
+  `binary_audio` is negotiated, cutting 26.8% overhead to ~0.4% (4818/4815
+  bytes vs 6561). Spans this repo and `voice-assistant-app`; the Pi 5 needed no
+  changes and stays on JSON. 57 device tests + 281 app tests pass, and the
+  deployed systemd service was verified negotiating binary framing and playing
+  a binary-framed tone through the real speaker over the SSH reverse tunnel.
+- Phase 5b, 6, 7 (silence eliding, barge-in, speaker verification) — designed,
+  not started; see `battery-plan.md` §4.
+
+**Phase 1 (power-meter baseline) was deliberately skipped**, 2026-07-29: the
+user has a meter but chose to defer it after confirming the device works well
+in practice. Phase 4's byte savings are measured and certain; what remains
+unmeasured is how much of *session energy* is byte-proportional. Take a reading
+before investing in Phase 5b, whose whole justification is radio power.
 
 **Checkpoint:** recorded idle + streaming current numbers; OS trims applied
 without breaking sessions.
