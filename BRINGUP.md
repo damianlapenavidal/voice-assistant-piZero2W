@@ -12,6 +12,16 @@ and continue where the scaffolding left off. Work top to bottom; each phase has 
 > `device_type` ("pi_zero_2w") differ. The laptop's `voice-assistant-app` owns
 > all intelligence and API keys; this device is a thin peripheral.
 
+> **One sanctioned exception to the frozen schema (Phase 4, 2026-07-29):**
+> `AUDIO_FRAME` and `PLAY_AUDIO` are sent as **binary** WebSocket frames — a
+> short packed header plus raw PCM — instead of JSON with base64 audio, cutting
+> 26.8% wire overhead to ~0.4%. It is gated behind a `binary_audio` capability
+> the device advertises in `HELLO` and the app confirms in `HELLO_ACK`'s
+> `negotiated_capabilities`, so nothing changes until both sides agree. Every
+> other message type, and the JSON envelope itself, is untouched. The Pi 5 does
+> not advertise the capability and is unaffected. Wire format is documented in
+> `voice-assistant-app/docs/protocol.md` → "Binary Audio Framing".
+
 ## Current status (already done)
 
 **Phases 1–5 below are complete and verified on real hardware** — confirmed live
