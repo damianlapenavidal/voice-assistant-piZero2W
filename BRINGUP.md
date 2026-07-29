@@ -14,6 +14,14 @@ and continue where the scaffolding left off. Work top to bottom; each phase has 
 
 ## Current status (already done)
 
+**Phases 1–5 below are complete and verified on real hardware** — confirmed live
+over SSH on 2026-07-29: the Zero runs `main` @ `ab68f3d` (tag
+`demo-baseline-2026-07-25`), `voice-assistant-pizero2w.service` is an enabled,
+running systemd user unit, `arecord -l`/`aplay -l` show a single working I2S
+card (`sndrpigooglevoi`, card 0), and both test suites pass on-device (39/39:
+`test_client.py` 9, `test_audio.py` 30 — grown from the original 23 as gain/
+volume-control tests were added). A full end-to-end demo ran the same day.
+
 - [x] Repo scaffolded and pushed to `github.com/damianlapenavidal/voice-assistant-piZero2W`.
 - [x] `zero2w_client.py` renamed from `pi5_client.py`: `class Zero2WClient`,
       `DEVICE_TYPE = "pi_zero_2w"`, logger/CLI strings updated.
@@ -21,8 +29,15 @@ and continue where the scaffolding left off. Work top to bottom; each phase has 
       `calibration_prompt.py`, `assets/say_hello_prompt.pcm` copied unchanged.
 - [x] I2S `.env.example` + docs (`hardware_gpio_i2s.md`, `alsa_bringup.md`,
       `battery.md`) written.
-- [x] Unit tests pass on a laptop with no hardware: **23/23**
-      (`test_client.py` 9, `test_audio.py` 14).
+- [x] Unit tests pass on a laptop with no hardware: 23/23 originally, **39/39
+      on-device now** (see above).
+- [x] Phases 1–5 (wiring, I2S card, ALSA validation, client install, full
+      end-to-end round trip) — done; see per-phase notes below.
+- [ ] Phase 6 (battery baseline + trims) — **in progress**, tracked in
+      [docs/battery-plan.md](docs/battery-plan.md) on branch
+      `battery/plan-barge-in` (not yet merged to `main`). Power-meter readings
+      (Phase 1 of that plan) are still outstanding; DSP-offload work (Phase 2)
+      is done and verified on-device but unmerged so `main` stays demo-clean.
 
 ## Architecture
 
@@ -75,7 +90,7 @@ Reboot.
 **Checkpoint:** `arecord -l` and `aplay -l` both show the I2S card. Note the
 `card,device` numbers. If not, `dmesg | grep -iE "i2s|asoc|voicehat"`.
 
-## Phase 3 — Validate ALSA (the real proof)
+## Phase 3 — Validate ALSA (the real proof) — done
 
 Follow [docs/alsa_bringup.md](docs/alsa_bringup.md). Install `alsa-utils`, then:
 
@@ -94,7 +109,7 @@ Replace `0,0` with your real `card,device`.
 **Checkpoint:** loopback plays back recorded voice cleanly. Everything downstream
 is easy once this passes; do not proceed until it does.
 
-## Phase 4 — Install + configure the client
+## Phase 4 — Install + configure the client — done
 
 On the Zero:
 
@@ -107,10 +122,16 @@ pip install -r requirements.txt
 cp .env.example .env         # set AUDIO_INPUT_DEVICE / AUDIO_OUTPUT_DEVICE to your card
 ```
 
-**Checkpoint:** `python test_client.py` and `python test_audio.py` pass on the
-Zero (23/23).
+The client also runs as a systemd user unit
+(`~/.config/systemd/user/voice-assistant-pizero2w.service`, enabled) so it
+survives reboots and reconnects on its own; `deploy.sh`-style updates use
+`git pull --ff-only`, so rolling the device *backward* needs an explicit
+`git checkout <tag>` rather than a pull.
 
-## Phase 5 — End-to-end with the laptop app
+**Checkpoint:** `python test_client.py` and `python test_audio.py` pass on the
+Zero — 39/39 as of 2026-07-29 (grew from 23 as gain/volume tests were added).
+
+## Phase 5 — End-to-end with the laptop app — done
 
 1. Start `voice-assistant-app` on the laptop with the WebSocket server.
 2. Find the laptop IP: `hostname -I | awk '{print $1}'` (Linux) /
@@ -129,13 +150,27 @@ Zero (23/23).
 > changes echo levels.
 
 **Checkpoint:** full round trip works — HELLO → calibration → speak → PLAY_AUDIO
-→ PLAYBACK_COMPLETE.
+→ PLAYBACK_COMPLETE. Verified live during the 2026-07-29 demo, on the
+`demo-baseline-2026-07-25` tag.
 
-## Phase 6 — Battery baseline + trims
+## Phase 6 — Battery baseline + trims — in progress
 
-Follow [docs/battery.md](docs/battery.md). Measure idle vs streaming current
-**before** optimizing, then apply OS trims. Defer amp SD_MODE / wake-button /
-idle-disconnect policy until v1 works.
+Superseded by the more detailed [docs/battery-plan.md](docs/battery-plan.md)
+(currently on branch `battery/plan-barge-in`, not yet on `main`). Follow
+[docs/battery.md](docs/battery.md) first for the measure-before-you-trim rule,
+then `battery-plan.md` for the phased software work. Status as of 2026-07-29:
+
+- Phase 1 (power-meter baseline: idle / streaming / deep-idle current) —
+  **not done**, the only fully outstanding item.
+- Phase 2 (push DSP into ALSA: playback softvol, mic-gain-in-ALSA, drop the
+  dead espeak fallback) — **done and verified on-device**, on
+  `battery/alsa-offload` + `battery/alsa-capture-route`, unmerged so `main`
+  stays demo-clean. Recovered ~22 points of one CPU core (18.4% → 3.4% while
+  streaming).
+- Phase 3 (move mic gain to the app) — **dropped**; Phase 2 already banked the
+  win on-device with no protocol change.
+- Phases 4–7 (binary frames, radio duty cycle, barge-in, speaker
+  verification) — designed, not started; see `battery-plan.md` §4.
 
 **Checkpoint:** recorded idle + streaming current numbers; OS trims applied
 without breaking sessions.

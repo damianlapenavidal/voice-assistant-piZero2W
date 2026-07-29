@@ -85,8 +85,10 @@ python test_audio.py
 
 ## What this device does and does not do
 
-- **Does:** ALSA capture/playback, calibration + echo gating, WebSocket framing,
-  status heartbeats.
+- **Does:** ALSA capture/playback, mic calibration (computes thresholds the app
+  uses), WebSocket framing, status heartbeats. Runtime echo gating (muting the
+  mic while the assistant speaks) is driven by the app's `MUTE_MIC`/`UNMUTE_MIC`
+  commands, not by on-device logic.
 - **Does not:** hold API keys, run OpenAI Realtime, or do barge-in / AEC. That
   intelligence stays on the laptop app.
 
