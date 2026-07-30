@@ -738,6 +738,58 @@ the Pi 5 shares. Phase 4's binary frames want a sequence and timestamp header
 anyway — design it so it can carry the alignment metadata 6c/6d need, because
 retrofitting that later is expensive.
 
+> **6a done 2026-07-29**, app-only, behind `BARGE_IN` (off by default). 6b, 6c
+> and 6d remain unbuilt; 6d's "do not start here" still stands.
+>
+> **The protocol note above turned out not to apply to 6a**, and that is the
+> most useful thing this phase learned. No new message type, no new capability,
+> and **no device change at all** — `MUTE_MIC`/`UNMUTE_MIC` keep meaning exactly
+> what they meant. Both device clients were already correct for this. 6c/6d will
+> still need the semantic change and the reserved header fields; 6a did not.
+>
+> **What this section got wrong.** "The app knows where the pauses are — it
+> holds the audio it is sending" is true but not sufficient. Audio arrives from
+> OpenAI far faster than real time, so a pause the app *sees* in the outgoing
+> stream is not a pause happening *now* at the speaker, and the delay between
+> them (SSH tunnel + `aplay`'s own ALSA buffer) is unknown and variable.
+> Estimating it would have spent the entire <50 ms echo margin §3 measured on
+> guesswork — with a false barge-in cancelling the assistant mid-sentence as the
+> failure mode, which is a worse product than no barge-in.
+>
+> **What was built instead: the app doesn't estimate, it creates the boundary.**
+> On finding a long enough pause in the outgoing audio, it ends the segment
+> there with `is_final=True`. The device drains playback and replies
+> `PLAYBACK_COMPLETE` — an exact, latency-free "the speaker has stopped" signal
+> that the app already handled. The listening window opens on that reply. Two
+> things fall out of this for free:
+> - Interrupting needs no stop-playback message. Nothing is playing during the
+>   window, so an interruption is just the app never sending the rest.
+> - The echo margin isn't spent on timing error at all, because there is none.
+>
+> Detection itself is not new code: with the mic live and the speaker quiet,
+> OpenAI's existing `semantic_vad` + `interrupt_response: True` does it. The only
+> app-side change was `_should_ignore_live_speech_vad()`, which suppressed VAD
+> for the whole time `_ai_speaking` was true — it now trusts VAD inside a window.
+>
+> **A second wall-clock trap, caught by the end-to-end test**: the floor on how
+> often a reply may be segmented (`BARGE_IN_MIN_SEGMENT_MS`) was first written
+> against `time.monotonic()`. It read ~0 ms for an entire reply — same
+> send-time-vs-playback-time confusion as above, one layer down — and suppressed
+> every boundary. It counts *delivered audio* now.
+>
+> **Battery cost, as this section demanded be stated**: bounded by construction
+> rather than doubled. The mic is open for `BARGE_IN_WINDOW_MS` (700 ms) per
+> segment boundary, and boundaries are floored at one per 1.5 s of delivered
+> audio — so worst case is ~700 ms of extra streaming per 2.2 s of reply, and a
+> reply with no long pauses costs nothing at all. Not measured against Phase 1's
+> numbers on hardware yet; that wants doing before the flag goes on for real.
+>
+> **Verification**: 304 app tests (was 288), including flag-off regression
+> coverage and two end-to-end tests that drive a real pause-shaped reply through
+> segmentation → drain → window → (resume | interrupt), asserting that an
+> uninterrupted reply still delivers every byte OpenAI produced, in order.
+> Loopback ignores the flag entirely — there is no reply to interrupt there.
+
 ### Phase 7 — Send only the child's voice (post-demo)
 
 Goal: ignore room noise, background parents, and unrelated chatter. Four
@@ -800,6 +852,40 @@ Order: level gate + logging (days) → evaluate from real logs → laptop-side
 verification only if the logs demand it → evaluate the second mic before
 buying more software. Effort: 1 day for the level gate, ~1 week for
 verification. Risk: low, then medium.
+
+> **Step 1 (level gate + logging) done 2026-07-29**, app-only. Steps 2-4 are
+> deliberately *not* done: evaluating from real logs is the next step and it
+> needs logs from real use, which is a data-collection task, not a coding one.
+> No speaker-verification model was added, and per this section that remains the
+> right call until the logs say otherwise.
+>
+> **Threshold**: `noise_floor + (user_speech_peak - noise_floor) * 0.5`, from the
+> metrics device calibration already sends. Plain speech detection sits lower on
+> purpose — a voice across the room clears the ambient floor easily but not the
+> near-field level the child was measured at.
+>
+> **Logging is on; rejecting is off** (`VOICE_LEVEL_GATE`, default false). This
+> is this section's own instruction taken literally: a rejection that is never
+> transmitted cannot be reviewed, so every frame is classified and counted
+> whether or not the verdict is allowed to act. Each user turn emits one
+> `audio_bridge.voice_level_summary` line (near-field frames, far-field frames,
+> peak RMS, threshold, and whether the gate was enforcing) — per-frame lines are
+> debug-only, since a 15 s turn is ~150 of them and nobody will read that.
+>
+> **Two guards that come straight from the failure asymmetry above.** A false
+> reject means the child is ignored and the product feels broken, which is worse
+> than answering the wrong person, so: (1) an unclassifiable frame — no
+> calibration yet, so no threshold — is never gated, because an unknown
+> threshold is not evidence of a distant speaker; and (2) once a frame is
+> accepted, the next 800 ms are accepted too, so unstressed syllables and
+> trailing words don't get cut out of the middle of a sentence.
+>
+> `AUDIO_GAP`'s synthesized silence is never gated — it exists to keep OpenAI's
+> timeline faithful (Phase 5b), and gating silence for being quiet would defeat
+> the point. There is a test asserting exactly that, because it is the kind of
+> interaction between two independently-correct features that only shows up live.
+>
+> **Verification**: 315 app tests (was 304 after Phase 6a).
 
 Protocol note: audio you decide not to forward interacts with OpenAI's server
 VAD turn detection — the same "reconstruct the timeline faithfully or
