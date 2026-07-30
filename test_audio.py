@@ -32,7 +32,7 @@ from audio_playback import (
     PLAYBACK_STEPS,
     PlaybackManager,
 )
-from zero2w_client import make_audio_frame, parse_message
+from zero2w_client import make_audio_frame, make_audio_gap, parse_message
 
 
 def _control(min_db: float, max_db: float, steps: int) -> SoftvolControl:
@@ -608,6 +608,25 @@ def _one_chunk_then_block(chunk: bytes):
 
     sent_one: list = []
     return read_chunk
+
+
+def _chunks_then_block(chunks: list):
+    """Generalization of _one_chunk_then_block: yields each chunk in order,
+    then blocks forever, for tests feeding a silence-then-speech sequence."""
+    index = {"i": 0}
+
+    async def read_chunk():
+        i = index["i"]
+        if i < len(chunks):
+            index["i"] += 1
+            return chunks[i]
+        await asyncio.Event().wait()
+
+    return read_chunk
+
+
+_QUIET_CHUNK = b"\x00\x00" * (CHUNK_BYTES // 2)  # RMS 0 -- well under any calibrated threshold
+_LOUD_CHUNK = struct.pack("<h", 20000) * (CHUNK_BYTES // 2)  # RMS 20000 -- well over
 
 
 async def _test_set_volume_updates_playback_gain():
@@ -1366,6 +1385,136 @@ async def _test_stop_playback_worker_survives_cancel_mid_final_chunk():
     print("  PASS: test_stop_playback_worker_survives_cancel_mid_final_chunk")
 
 
+def _test_chunk_rms_stride_approximates_full_precision():
+    """The cheap stride=4 RMS used for elision stays close to the full
+    (stride=1) value calibration relies on -- close enough to gate on, not
+    identical (that's the whole point of subsampling)."""
+    from audio_gating import chunk_rms
+
+    full = chunk_rms(_LOUD_CHUNK)
+    approx = chunk_rms(_LOUD_CHUNK, stride=4)
+    assert full == 20000.0
+    assert approx == 20000.0  # constant-amplitude signal: subsampling changes nothing
+
+    assert chunk_rms(_QUIET_CHUNK, stride=4) == 0.0
+
+    print("  PASS: test_chunk_rms_stride_approximates_full_precision")
+
+
+def _test_make_audio_gap_message_shape():
+    from zero2w_client import parse_message
+
+    raw = make_audio_gap(850, 12)
+    msg = parse_message(raw)
+
+    assert msg["type"] == "AUDIO_GAP"
+    assert msg["payload"]["duration_ms"] == 850
+    assert msg["payload"]["sequence_number"] == 12
+    assert msg["payload"]["reason"] == "silence"
+
+    print("  PASS: test_make_audio_gap_message_shape")
+
+
+async def _test_audio_stream_loop_flag_off_sends_all_quiet_chunks():
+    """ELIDE_SILENCE off (the default) must reproduce today's exact
+    behavior: every chunk sent as AUDIO_FRAME, even pure silence."""
+    from zero2w_client import Zero2WClient
+
+    client = Zero2WClient("ws://test")
+    client.is_recording = True
+    client._stream_to_laptop = True
+    client._audio_capture.read_chunk = _one_chunk_then_block(_QUIET_CHUNK)
+
+    sent: list = []
+    ws = MagicMock()
+    ws.send = AsyncMock(side_effect=lambda m: sent.append(m))
+
+    task = asyncio.create_task(client._audio_stream_loop(ws))
+    await asyncio.sleep(0.02)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert len(sent) == 1
+    assert json.loads(sent[0])["type"] == "AUDIO_FRAME"
+
+    print("  PASS: test_audio_stream_loop_flag_off_sends_all_quiet_chunks")
+
+
+async def _test_audio_stream_loop_elides_and_flushes_gap():
+    """ELIDE_SILENCE on: quiet chunks aren't sent as AUDIO_FRAME; once enough
+    accumulates, one AUDIO_GAP flushes with the batched duration."""
+    from zero2w_client import Zero2WClient
+
+    client = Zero2WClient("ws://test")
+    client.is_recording = True
+    client._stream_to_laptop = True
+    client._audio_capture.read_chunk = _chunks_then_block([_QUIET_CHUNK] * 5)
+
+    sent: list = []
+    ws = MagicMock()
+    ws.send = AsyncMock(side_effect=lambda m: sent.append(m))
+
+    with patch("zero2w_client.ELIDE_SILENCE", True), \
+         patch("zero2w_client.GAP_FLUSH_INTERVAL_MS", 250):
+        task = asyncio.create_task(client._audio_stream_loop(ws))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert len(sent) == 1
+    msg = json.loads(sent[0])
+    assert msg["type"] == "AUDIO_GAP"
+    assert msg["payload"]["duration_ms"] >= 250
+    assert msg["payload"]["reason"] == "silence"
+    assert msg["payload"]["sequence_number"] == 1  # no real frame sent yet
+
+    print("  PASS: test_audio_stream_loop_elides_and_flushes_gap")
+
+
+async def _test_audio_stream_loop_flushes_partial_gap_when_speech_resumes():
+    """A gap shorter than the flush interval still flushes immediately once
+    speech resumes, in order, before the resuming frame."""
+    from zero2w_client import Zero2WClient
+
+    client = Zero2WClient("ws://test")
+    client.is_recording = True
+    client._stream_to_laptop = True
+    client._audio_capture.read_chunk = _chunks_then_block(
+        [_QUIET_CHUNK, _QUIET_CHUNK, _LOUD_CHUNK],
+    )
+
+    sent: list = []
+    ws = MagicMock()
+    ws.send = AsyncMock(side_effect=lambda m: sent.append(m))
+
+    with patch("zero2w_client.ELIDE_SILENCE", True), \
+         patch("zero2w_client.GAP_FLUSH_INTERVAL_MS", 1000):  # never hit by 2 quiet chunks
+        task = asyncio.create_task(client._audio_stream_loop(ws))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert len(sent) == 2
+    gap = json.loads(sent[0])
+    frame = json.loads(sent[1])
+    assert gap["type"] == "AUDIO_GAP"
+    assert gap["payload"]["duration_ms"] == 200  # 2 quiet chunks * 100ms
+    assert gap["payload"]["sequence_number"] == 1  # predicts the frame about to send
+    assert frame["type"] == "AUDIO_FRAME"
+    assert frame["payload"]["sequence_number"] == 1
+
+    print("  PASS: test_audio_stream_loop_flushes_partial_gap_when_speech_resumes")
+
+
 def run_async_test(coro):
     asyncio.run(coro)
 
@@ -1378,6 +1527,8 @@ def main():
         _test_gain_to_softvol_index_matches_measured_curve,
         _test_loud_source_cannot_be_boosted_into_clipping,
         _test_volume_percent_gain_roundtrip,
+        _test_chunk_rms_stride_approximates_full_precision,
+        _test_make_audio_gap_message_shape,
     ]
     async_tests = [
         _test_audio_capture_read_chunk,
@@ -1417,6 +1568,9 @@ def main():
         _test_receive_loop_queues_binary_play_audio,
         _test_receive_loop_drops_malformed_binary_frame,
         _test_stop_playback_worker_survives_cancel_mid_final_chunk,
+        _test_audio_stream_loop_flag_off_sends_all_quiet_chunks,
+        _test_audio_stream_loop_elides_and_flushes_gap,
+        _test_audio_stream_loop_flushes_partial_gap_when_speech_resumes,
     ]
 
     total = len(sync_tests) + len(async_tests)

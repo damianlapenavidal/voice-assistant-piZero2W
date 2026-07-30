@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from audio_capture import AudioCapture, AudioCaptureError, CHUNK_BYTES
-from audio_gating import AudioGating, CalibrationPhase, CalibrationStep
+from audio_gating import CHUNK_MS, AudioGating, CalibrationPhase, CalibrationStep, chunk_rms
 from audio_playback import PlaybackError, PlaybackManager
 from calibration_prompt import (
     PROMPT_TEXT,
@@ -65,6 +65,14 @@ DEVICE_TYPE = "pi_zero_2w"
 FIRMWARE_VERSION = "0.1.0"
 CAPABILITIES = ["audio_capture", "audio_playback", "binary_audio"]
 STATUS_INTERVAL_SECONDS = 10
+
+# Phase 5b of docs/battery-plan.md: elide silent chunks from the stream
+# instead of sending them, replacing long runs of silence with an occasional
+# AUDIO_GAP marker the app uses to synthesize the missing audio. Off by
+# default -- "do it last, behind a flag" per the plan, since it re-adds a
+# per-sample CPU cost Phase 2 deliberately removed.
+ELIDE_SILENCE = os.getenv("ELIDE_SILENCE", "false").lower() in ("true", "1", "yes")
+GAP_FLUSH_INTERVAL_MS = 1000  # batch markers ~once/second -- radio wakes on wake frequency, not just bytes
 
 # Binary AUDIO_FRAME/PLAY_AUDIO framing (Phase 4 of docs/battery-plan.md),
 # used only once "binary_audio" is negotiated in HELLO_ACK -- see
@@ -354,6 +362,23 @@ def make_playback_complete(sequence_number: int, duration_ms: int) -> str:
     })
 
 
+def make_audio_gap(duration_ms: int, sequence_number: int, reason: str = "silence") -> str:
+    """Tell the app to synthesize duration_ms of audio before sequence_number.
+
+    `sequence_number` is the value the *next real* AUDIO_FRAME will carry --
+    elided chunks never increment it, so an unexplained jump in consecutive
+    sequence numbers still means a genuinely dropped frame; a jump preceded
+    by this marker is accounted for. `reason` is always "silence" today;
+    kept general so a future gate (e.g. non-target-speaker elision) can
+    reuse this same message type instead of inventing a second one.
+    """
+    return make_message("AUDIO_GAP", {
+        "duration_ms": duration_ms,
+        "sequence_number": sequence_number,
+        "reason": reason,
+    })
+
+
 def make_calibration_status(phase: str) -> str:
     """Notify the app of the current calibration phase (quiet or speak)."""
     return make_message("CALIBRATION_STATUS", {"phase": phase})
@@ -388,6 +413,7 @@ class Zero2WClient:
         )
         self._audio_task: asyncio.Task | None = None
         self._sequence_number = 0
+        self._elided_ms = 0.0
         self._mic_muted = False
         self._calibration_playing_prompt = False
         self._calibration_retries = 0
@@ -696,6 +722,7 @@ class Zero2WClient:
         self.is_recording = True
         self._status_event.set()
         self._sequence_number = 0
+        self._elided_ms = 0.0
         self._calibration_retries = 0
         self._mic_muted = False
 
@@ -779,8 +806,34 @@ class Zero2WClient:
                 if not self._stream_to_laptop or self._mic_muted:
                     continue
 
-                # Stream continuous PCM including silence — OpenAI server VAD needs
-                # quiet periods after speech to detect end-of-turn.
+                # The app needs a faithful timeline of speech vs. silence --
+                # OpenAI's turn detection judges when the user is done talking
+                # from that -- so silence isn't dropped, only elided from the
+                # wire: a cheap approximate RMS (stride=4 -- full precision is
+                # calibration's job, not every streamed chunk's) gates it
+                # against the threshold calibration already measured, and long
+                # runs collapse into an occasional AUDIO_GAP marker the app
+                # re-expands into real silence before it reaches OpenAI.
+                is_silence = ELIDE_SILENCE and (
+                    chunk_rms(chunk, stride=4) < self._audio_gating.speech_start_threshold()
+                )
+
+                if is_silence:
+                    self._elided_ms += CHUNK_MS
+                    if self._elided_ms >= GAP_FLUSH_INTERVAL_MS:
+                        await ws.send(make_audio_gap(int(self._elided_ms), self._sequence_number + 1))
+                        logger.debug("Sent AUDIO_GAP (%dms elided)", int(self._elided_ms))
+                        self._elided_ms = 0.0
+                    continue
+
+                if self._elided_ms > 0:
+                    # Speech resumed with a partial gap still pending (or
+                    # elision just turned off mid-gap) -- flush it before the
+                    # resuming frame so the app hears the silence in order.
+                    await ws.send(make_audio_gap(int(self._elided_ms), self._sequence_number + 1))
+                    logger.debug("Sent AUDIO_GAP (%dms elided, resuming)", int(self._elided_ms))
+                    self._elided_ms = 0.0
+
                 self._sequence_number += 1
                 capture_ts = utc_now_iso()
                 frame = make_audio_frame(
