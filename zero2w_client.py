@@ -1076,6 +1076,15 @@ def main():
 
     load_device_env()
 
+    # ELIDE_SILENCE is read once at import time (above) so tests can patch it
+    # as a plain module attribute -- but that means it's frozen before
+    # load_device_env() has populated os.environ from .env. Re-derive it now
+    # that .env is actually loaded, or setting it there would silently do
+    # nothing (every other .env-driven value in this file is read lazily,
+    # inside __init__ or inline, specifically to avoid this).
+    global ELIDE_SILENCE
+    ELIDE_SILENCE = os.getenv("ELIDE_SILENCE", "false").lower() in ("true", "1", "yes")
+
     logger.info("Pi Zero 2W Voice Assistant Client v%s", FIRMWARE_VERSION)
     logger.info("Device ID: %s | Platform: %s", get_device_id(), platform.platform())
     logger.info("Target server: %s", args.server_url)
@@ -1084,6 +1093,7 @@ def main():
         os.environ.get("AUDIO_INPUT_DEVICE", "(default)"),
         os.environ.get("AUDIO_OUTPUT_DEVICE", "(default)"),
     )
+    logger.info("Silence elision: %s", "on" if ELIDE_SILENCE else "off")
     # Loud at startup rather than quiet until the first session: without this
     # asset calibration cannot run at all, and there is no synthesis fallback
     # (see calibration_prompt). Not fatal -- a resumed session skips
