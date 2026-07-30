@@ -140,6 +140,10 @@ doesn't). Do not attempt to extract a shared module before the demo — it is a
 bigger job than it looks and touches every file in both device repos. Land
 changes on the Zero first; port to the Pi 5 deliberately, afterwards.
 
+Phases 4, 5a and 5b have since been ported that way (2026-07-29) — see the
+"Pi 5 port" callout after Phase 5b. Phase 2 has not, and that divergence is now
+the main one: the Pi 5 still applies mic/playback gain in Python.
+
 ---
 
 ## 3. Measured baseline
@@ -626,6 +630,52 @@ Effort: 1-2 days. Risk: high. Do it last, behind a flag.
 
 ---
 
+### Pi 5 port of Phases 4 / 5a / 5b (done 2026-07-29)
+
+§2 said to prove changes on the Zero first and port to the Pi 5 deliberately,
+afterwards. That port is now done for the three phases that are pure
+protocol/logic:
+
+- **Phase 4** — `pi5_client.py` advertises `binary_audio`, negotiates it from
+  `HELLO_ACK`, and sends/receives the same binary headers. The struct layouts,
+  tags and `HEADER_VERSION` are byte-identical to the Zero's on purpose: one app
+  decodes both, so a divergence here would be a silent audio-corruption bug on
+  whichever device drifted.
+- **Phase 5a** — event-driven `DEVICE_STATUS`, same `_status_event` mechanism.
+- **Phase 5b** — `ELIDE_SILENCE` + `AUDIO_GAP` + `chunk_rms(stride=4)`, flag
+  off by default, same as the Zero.
+
+**Also ported: the `task_done` crash fix.** The Pi 5 carried its own copy of the
+`_stop_playback_worker()` race found live on the Zero during Phase 1 (the queue
+is nil'd before the worker is cancelled, so a cancellation landing inside
+`finalize_streaming()` hit `None.task_done()` and killed the client). Same bug,
+same fix, and the same regression test now guards it here.
+
+**Not ported: Phase 2.** It is tied to an `~/.asoundrc` written for the Zero's
+specific I2S card, including a `route` plugin that exists only to pick the mic's
+channel out of an I2S frame — a problem a USB mic does not have. Its payoff was
+~22% of one core on a single-core-class device; on a mains-powered quad-A76 the
+remaining draw is the *responsiveness* simplification (`softvol` sits downstream
+of `aplay`'s buffer, which is what lets the Zero drop the paced sub-chunk writes
+the Pi 5 still needs). Writing and verifying a USB-card `asoundrc` needs the Pi 5
+physically present, so this stays open, deliberately.
+
+**Verification, given the Pi 5 was unreachable.** 55 Pi 5 tests pass (was 33),
+covering every ported phase. On top of that, the real `Pi5Client` was run against
+the real app `WebSocketTransport`/`SessionManager` on localhost with only
+`arecord`/`aplay` stubbed — 10/10 interop checks: the app decoded Pi-5-produced
+binary `AUDIO_FRAME`s with PCM intact, the Pi 5 decoded app-produced binary
+`PLAY_AUDIO` with PCM intact, and `AUDIO_GAP` markers arrived with the
+`sequence_number` correctly predicting the resuming frame. That covers everything
+the port actually changed; what still needs the hardware is the audio path itself,
+which the port did not touch.
+
+Three stale claims in the app's `docs/protocol.md` — all of the form "an
+unmodified Pi 5 stays on JSON" — were corrected, since the Pi 5 now negotiates
+binary too.
+
+---
+
 ### Phase 6 — Barge-in: letting the user interrupt (post-demo)
 
 The mic is muted while the assistant speaks, so the child cannot interrupt.
@@ -774,18 +824,25 @@ branch keeps.
 
 ## 6. Loose ends
 
-- `../voice-assistant-pi5-calibration-fix.patch` sits unversioned in the parent
+- ~~`../voice-assistant-pi5-calibration-fix.patch` sits unversioned in the parent
   directory. Unknown provenance; check whether it is already applied before the
-  Pi 5 port.
+  Pi 5 port.~~ — **answered 2026-07-29.** Fully applied. It targets an old
+  `device/` layout and every change in it is present in `voice-assistant-pi5`
+  today: `drain_buffered_audio()`, `PROMPT_SETTLE_SEC = 0.6`,
+  `POST_PROMPT_GRACE_CHUNKS` 6→8, and all four of its tests. The file is a stale
+  artifact and can be deleted.
 - The `demo-baseline-2026-07-25-uncommitted` tag in the app repo is now
   redundant (that work is committed as `6b2d0ba`/`dae9c4c`). Harmless; delete
   after the demo.
 - `CalibrationPhase` is imported but unused at
   [zero2w_client.py:35](../zero2w_client.py#L35).
-- `speech_start_threshold()` is computed and shipped to the app but never used
-  on-device — despite the module name, `audio_gating.py` does calibration only,
-  and runtime gating is entirely the app's `MUTE_MIC`/`UNMUTE_MIC`. Worth
-  correcting the "echo gating" claim in [README.md:88-89](../README.md#L88-L89).
+- ~~`speech_start_threshold()` is computed and shipped to the app but never used
+  on-device~~ — **no longer true as of Phase 5b (2026-07-29):** it is now the
+  threshold the silence-elision gate compares each chunk's RMS against, on both
+  devices, so `audio_gating.py` does do runtime gating when `ELIDE_SILENCE` is
+  on. Turn-level gating is still entirely the app's `MUTE_MIC`/`UNMUTE_MIC`, so
+  the "echo gating" claim in [README.md:88-89](../README.md#L88-L89) is still
+  worth correcting.
 - ~~`config/targets.local.env` records `PIZERO2W_SAMPLE_RATE="48000"` and
   `PIZERO2W_CAPTURE_FORMAT="S32_LE"`, but the client hardcodes 24 kHz /
   `S16_LE`~~ — **answered 2026-07-26.** Those values are the hardware's, not a
