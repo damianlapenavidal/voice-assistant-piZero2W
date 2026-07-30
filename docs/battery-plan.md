@@ -586,6 +586,44 @@ Three more, learned since:
 
 Effort: 1-2 days. Risk: high. Do it last, behind a flag.
 
+> **Done 2026-07-29**, across both repos, gated behind `ELIDE_SILENCE`
+> (device env var, off by default — the flag this section asked for).
+>
+> **One thing changed since this section was written:** the app's turn
+> detection turned out to already be `"type": "semantic_vad"`
+> (`openai_client/realtime.py`), not `server_vad` — no `silence_duration_ms`
+> is ever sent to OpenAI, only `eagerness`. End-of-turn is the model's
+> semantic judgment on speech content, not a fixed silence timer. That likely
+> makes faithful timeline reconstruction *less* fragile than this section
+> assumed when it was written — but reconstructing faithfully (feeding
+> OpenAI real synthesized silence, not just skipping the gap) was still the
+> right call: it makes the optimization invisible downstream without betting
+> on undocumented VAD internals that could change.
+>
+> **Mechanism**: a new `AUDIO_GAP` message (device→app), carrying
+> `duration_ms`, and `sequence_number` (the value the *next real*
+> `AUDIO_FRAME` will carry — elided chunks never increment it, so an
+> unexplained sequence jump still means a genuinely dropped frame), and
+> `reason` (always `"silence"` today, kept general so **Phase 7 can reuse
+> this exact message type** rather than inventing a second one, per this
+> section's own requirement that they share one mechanism).
+>
+> **The per-sample cost was real but cheaper than the worst case**: the RMS
+> gate reuses `chunk_rms()` (already existed for calibration) with a new
+> `stride=4` option — calibration keeps full precision (`stride=1`) since it
+> only runs once per session; the gate that now runs on every streamed chunk
+> uses the cheaper approximation this section suggested.
+>
+> **Batching**: gaps flush every ~1s during long silence (radio wakes track
+> wake frequency, not just bytes — the whole reason to batch) and
+> immediately the moment real speech resumes, before the resuming frame, so
+> the reconstructed timeline stays in order.
+>
+> **Verification**: 63 device tests (was 57) and 288 app tests (was 281)
+> pass, including a flag-off regression test proving today's exact
+> unconditional-streaming behavior is unchanged byte-for-byte when
+> `ELIDE_SILENCE` is off.
+
 ---
 
 ### Phase 6 — Barge-in: letting the user interrupt (post-demo)

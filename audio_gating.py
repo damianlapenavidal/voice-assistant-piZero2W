@@ -40,12 +40,18 @@ class CalibrationStep(str, Enum):
     SPEECH_TIMEOUT = "speech_timeout"
 
 
-def chunk_rms(chunk: bytes) -> float:
-    """Root-mean-square level for a PCM16 little-endian chunk."""
+def chunk_rms(chunk: bytes, stride: int = 1) -> float:
+    """Root-mean-square level for a PCM16 little-endian chunk.
+
+    `stride` subsamples every Nth sample instead of all of them -- cheap
+    insurance against the cost of running this on every streamed chunk
+    rather than just during calibration. Calibration keeps the default
+    (every sample) since it sets the noise_floor baseline for the session.
+    """
     if len(chunk) < BYTES_PER_SAMPLE:
         return 0.0
     count = len(chunk) // BYTES_PER_SAMPLE
-    samples = struct.unpack(f"<{count}h", chunk[: count * BYTES_PER_SAMPLE])
+    samples = struct.unpack(f"<{count}h", chunk[: count * BYTES_PER_SAMPLE])[::stride]
     if not samples:
         return 0.0
     return (sum(s * s for s in samples) / len(samples)) ** 0.5

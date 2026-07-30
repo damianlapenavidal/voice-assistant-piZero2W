@@ -197,14 +197,27 @@ phased software work. Status as of 2026-07-29:
   changes and stays on JSON. 57 device tests + 281 app tests pass, and the
   deployed systemd service was verified negotiating binary framing and playing
   a binary-framed tone through the real speaker over the SSH reverse tunnel.
-- Phase 5b, 6, 7 (silence eliding, barge-in, speaker verification) — designed,
-  not started; see `battery-plan.md` §4.
+- Phase 5b (elide silence) — **done and deployed**, 2026-07-29: silent chunks
+  are elided behind `ELIDE_SILENCE` (device env var, off by default) instead
+  of streaming continuously; long silences collapse into an occasional
+  `AUDIO_GAP` marker the app expands back into real synthesized silence
+  before OpenAI sees it. Spans this repo and `voice-assistant-app`. 63 device
+  tests + 288 app tests pass, including a flag-off regression test proving
+  today's default behavior is unchanged byte-for-byte. See
+  `battery-plan.md`'s Phase 5b section for the `semantic_vad` finding that
+  changed the risk picture partway through.
+- Phase 6, 7 (barge-in, speaker verification) — designed, not started; see
+  `battery-plan.md` §4.
 
-**Phase 1 (power-meter baseline) was deliberately skipped**, 2026-07-29: the
-user has a meter but chose to defer it after confirming the device works well
-in practice. Phase 4's byte savings are measured and certain; what remains
-unmeasured is how much of *session energy* is byte-proportional. Take a reading
-before investing in Phase 5b, whose whole justification is radio power.
+**Phase 1 (power-meter baseline) is done**, 2026-07-29: idle 5.115V/0.087A/
+0.451W, streaming 5.115V/0.122A/0.621W (+0.035A/+0.170W, ~38% over idle),
+deep idle **identical to idle** (5.115V/0.087A/0.451W) — holding the
+WebSocket connection open costs nothing measurable over disconnecting
+entirely, since Wi-Fi association is already the idle floor either way.
+Found and fixed a real crash along the way: stopping playback right after a
+final chunk raced `_stop_playback_worker`'s queue teardown against the
+worker's own `finally: task_done()`, crashing the client (systemd caught and
+restarted it). Fixed, regression-tested, deployed.
 
 **Checkpoint:** recorded idle + streaming current numbers; OS trims applied
 without breaking sessions.
